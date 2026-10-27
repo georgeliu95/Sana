@@ -13,8 +13,9 @@ import os
 from pathlib import Path
 import sys
 
+from runtime.profiling import observed
 from .h3_upscale import load_upscaler
-from .single_gpu_all2all import single_gpu_all2all_factory
+from .nccl_all2all import nccl_all2all_factory
 
 SIGMAS = (0.909375, 0.725, 0.421875, 0.0)
 TILES = {"frames": {"tile_size": 128, "overlap": 24},
@@ -35,11 +36,11 @@ def public_refiner_modules(ltx_root):
         if str(path) not in sys.path:
             sys.path.insert(0, str(path))
     os.environ["H3_LTX_SOURCE_FRAMES"] = "124"
-    os.environ["H3_LTX_OUTPUT_FRAMES"] = "121"
+    os.environ["H3_LTX_OUTPUT_FRAMES"] = "129"
     os.environ["SOL_ATTN_STRICT"] = "1"
     base = importlib.import_module("refiner_encoder_ablation_single_gpu")
     compat = importlib.import_module("official_compat_h3_refiner_diagnostic")
-    if (base.FRAME_COUNT, base.WIDTH, base.HEIGHT, tuple(base.STAGE2_SIGMAS)) != (121, 1344, 768, SIGMAS):
+    if (base.FRAME_COUNT, base.WIDTH, base.HEIGHT, tuple(base.STAGE2_SIGMAS)) != (129, 1344, 768, SIGMAS):
         raise RuntimeError("public Refiner geometry or sigma contract changed")
     return base, compat
 
@@ -48,7 +49,7 @@ def construct(models, paths, *, torch, dist, compile_enabled, base, compat):
     from .h3_ltx_adapter import H3ToLTXAdapter
     from ltx_core.model.transformer.model import LTXModelType
 
-    models.rank, models.world_size = 0, 1
+    models.rank, models.world_size = dist.get_rank(), dist.get_world_size()
     models.device, models.dtype = torch.device("cuda", 0), torch.bfloat16
     models.compile_enabled = compile_enabled
     models.attention_backend = "sol"
@@ -63,15 +64,19 @@ def construct(models, paths, *, torch, dist, compile_enabled, base, compat):
     models.h3_upscaler, models.h3_spatial_route = load_upscaler(
         paths["h3_upscaler_source"], paths["h3_upscaler_checkpoint"],
         device=models.device, torch_module=torch)
+    models.bridge_partition_receipt = None
+    if os.environ.get("SPARK_CP_BRIDGE_PARTITION") == "1":
+        from .parallel_upscaler import install as install_parallel_upscaler
+        models.bridge_partition_receipt = install_parallel_upscaler(models.h3_upscaler)
     models.h3_ltx_adapter = H3ToLTXAdapter.from_pretrained(
         paths["adapter_dir"], device=models.device, dtype=models.dtype)
 
-    pixel_shape = base.VideoPixelShape(batch=1, frames=121, height=768, width=1344, fps=24)
+    pixel_shape = base.VideoPixelShape(batch=1, frames=129, height=768, width=1344, fps=24)
     latent_shape = base.VideoLatentShape.from_pixel_shape(pixel_shape, scale_factors=base.VIDEO_SCALE_FACTORS)
     models.video_tools = base.VideoLatentTools(base.VideoLatentPatchifier(patch_size=1),
         latent_shape, 24.0, scale_factors=base.VIDEO_SCALE_FACTORS)
     registry = base.ModelRegistry()
-    compilation = (base.CompilationConfig(mode=base.COMPILE_MODE, fullgraph=False,
+    compilation = (base.CompilationConfig(mode=("max-autotune" if os.environ.get("SPARK_LTX_V2_MODE") == "graph" else base.COMPILE_MODE), fullgraph=False,
         dynamic=None, seq_dim_dynamic=False, capture=False) if compile_enabled else None)
     lora = base.LoraPathStrengthAndSDOps(str(paths["refiner_lora"]), 0.8, base.LTXV_LORA_COMFY_RENAMING_MAP)
     stage = base.DiffusionStage.from_checkpoint(str(paths["transformer"]), models.dtype,
@@ -82,12 +87,12 @@ def construct(models, paths, *, torch, dist, compile_enabled, base, compat):
     heads, head_dim = int(model_config["num_attention_heads"]), int(model_config["attention_head_dim"])
     if (int(model_config["num_layers"]), heads, head_dim) != (48, 32, 128):
         raise RuntimeError("expected the original 48-layer, 32-head LTX joint refiner")
-    with single_gpu_all2all_factory(torch_module=torch) as all2all:
+    with nccl_all2all_factory() as all2all:
         manager = base.AttentionManager(max_tokens=65536, num_heads=heads,
             head_dim=head_dim, tensor_dtype=models.dtype, group=dist.group.WORLD)
     models.all2all_receipt = all2all
-    if all2all["single_gpu_instances"] != 4 or all2all["delegated_instances"] != 0 or manager.copy_out:
-        raise RuntimeError("expected four singleton copy-eliding All2All buffers")
+    if all2all["instances"] != 4 or all2all["world_size"] != models.world_size or manager.copy_out:
+        raise RuntimeError("expected four All2All instances in the LTX CP group")
     models.attention_manager = manager
     models.steady_all2all_timeout_s = manager.all2all_timeout_seconds
     if compile_enabled:
@@ -106,6 +111,18 @@ def construct(models, paths, *, torch, dist, compile_enabled, base, compat):
         core = core.model
     if core.model_type != LTXModelType.AudioVideo:
         raise RuntimeError("Spark requires the full joint AudioVideo model")
+    models.qkv_merged = 0
+    if os.environ.get("SPARK_LTX_V2_MODE") in ("qkv", "norm_qkv"):
+        from .spark_v2.qkv import install as install_qkv
+        models.qkv_merged = install_qkv(core)
+        if models.qkv_merged != 288:
+            raise RuntimeError(f"expected 288 merged Attention modules, got {models.qkv_merged}")
+    models.ltx_fc2_port = None
+    if os.environ.get("SPARK_V2_LTX_FC2", "0") == "1":
+        from dataclasses import asdict
+        from .fullopt_v2 import install
+        models.ltx_fc2_port = asdict(install(core))
+    core.forward = observed('Spark/LTX/joint_denoiser', core.forward)
     models.wrapped_transformer = base.BatchSplitAdapter(models.transformer, max_batch_size=1)
     audio_block = compat.AudioConditioner(str(paths["audio_vae"]), models.dtype, models.device,
         registry=registry, alloc_trim_strategy=base.AllocatorTrimStrategy.DEFER)
@@ -116,8 +133,11 @@ def construct(models, paths, *, torch, dist, compile_enabled, base, compat):
     decoder_block = compat.VideoDecoder(str(paths["output_video_vae"]), models.dtype,
         models.device, registry=registry, alloc_trim_strategy=base.AllocatorTrimStrategy.DEFER)
     # Original explicit Conv tiles. Resolve before constructing decoder weights.
+    actual_tiles = {name: dict(value) for name, value in TILES.items()}
+    if os.environ.get("SPARK_LTX_V2_MODE") == "tile":
+        actual_tiles["height"]["tile_size"], actual_tiles["width"]["tile_size"] = 512, 896
     models.tiling_config = compat.TileSizeConfig(**{
-        name: compat.DimensionSizeConfig(**value) for name, value in TILES.items()})
+        name: compat.DimensionSizeConfig(**value) for name, value in actual_tiles.items()})
     models.tiling_config.validate(
         compat.tiling_scale_factors_for_vae(str(paths["output_video_vae"])), pixel_shape)
     models.tiling_source = "original_Conv128_448x768"
@@ -125,8 +145,13 @@ def construct(models, paths, *, torch, dist, compile_enabled, base, compat):
     torch.cuda.empty_cache()
     models.video_decoder = decoder_block._decoder_builder.build(
         device=models.device, dtype=models.dtype).eval().requires_grad_(False)
+    models.video_decoder.forward = observed('Spark/LTX/ConvVAE/forward', models.video_decoder.forward)
     if type(models.video_decoder).__name__ != "ConvVideoDecoder":
         raise RuntimeError("the output checkpoint must build the original ConvVideoDecoder")
+    models.vae_partition_receipt = None
+    if os.environ.get("SPARK_CP_VAE_PARTITION") == "1":
+        from .parallel_vae import install as install_parallel_vae
+        models.vae_partition_receipt = install_parallel_vae(models.video_decoder)
     models.parameter_dtypes = dict(Counter(str(p.dtype) for p in models.transformer.parameters()))
     if (not models.parameter_dtypes.get("torch.bfloat16")
             or not set(models.parameter_dtypes) <= {"torch.bfloat16", "torch.float32"}):

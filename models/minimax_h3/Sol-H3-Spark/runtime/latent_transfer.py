@@ -9,12 +9,12 @@ import re
 from .config import TASKS
 
 H3_SHAPE = (1, 24, 37, 24, 42)
-AUDIO_SHAPE = (1, 2, 161333)
+AUDIO_SHAPE = (1, 2, 165600)
 MAX_PAYLOAD_BYTES = 4 * 1024**2
 WIRE_METADATA = {
     "input_variant": "h3_adapter", "primary_kind": "h3_normalized_latent",
     "normalization": "released_h3_per_channel_mean_std", "generation_frames": 124,
-    "adapter_pixel_frames": 124, "padded_canvas_frames": 129, "emitted_frames": 121,
+    "adapter_pixel_frames": 124, "padded_canvas_frames": 129, "emitted_frames": 124,
     "pixel_height": 384, "pixel_width": 672, "fps": 24.0, "audio_sample_rate": 32000,
 }
 

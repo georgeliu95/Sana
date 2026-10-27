@@ -28,6 +28,9 @@ def install_capture(worker):
         return result.hexdigest()
 
     def video_capture(batch, fastvideo_args):
+        if not rank0:
+            batch.output = torch.empty((0, 3, 0, 0, 0), device="cpu", dtype=torch.float32)
+            return batch
         target = state["target"] if rank0 else None
         if target is not None:
             layout = batch.extra[MINIMAX_H3_LAYOUT_KEY]
@@ -49,6 +52,9 @@ def install_capture(worker):
             if native.dtype != torch.float32 or not bool(torch.isfinite(native).all()):
                 raise RuntimeError("expected finite native FP32 normalized H3 latent")
             state["native_normalized"] = native
+            from ..early_handoff import enabled, publish_video
+            if enabled(target.get("request_id", target["case_id"])):
+                publish_video(Path(target["directory"]), native, target)
         if not rank0 or target is None or batch.save_video or batch.return_frames:
             raise RuntimeError("latent capture requires rank zero and disabled video output")
         # output_type remains native: the audio stage must still decode PCM.
@@ -56,17 +62,25 @@ def install_capture(worker):
         return batch
 
     def audio_capture(batch, fastvideo_args):
+        from ..early_handoff import AudioRelease, enabled, wait_ready
+        target = state["target"] if rank0 else None
+        if target is not None and enabled(target.get("request_id", target["case_id"])):
+            from ..profiling import scope
+            with scope("Spark/bridge/H3_audio_wait_upscaler"):
+                path = wait_ready(Path(target["directory"]) / "audio-release.json",
+                                  target.get("request_id", target["case_id"]))
+                AudioRelease.model_validate_json(path.read_text())
         result = original_audio(batch, fastvideo_args)
         target = state["target"] if rank0 else None
         if target is not None:
             pcm = result.extra["audio"]
-            if pcm.ndim != 2 or pcm.shape[1] != 2 or pcm.shape[0] < 161333:
+            if pcm.ndim != 2 or pcm.shape[1] != 2 or pcm.shape[0] != 165600:
                 raise RuntimeError(f"unexpected native stereo PCM: {pcm.shape}")
             if pcm.dtype != torch.float32 or result.extra["audio_sample_rate"] != 32000:
                 raise RuntimeError("native PCM dtype/sample rate drift")
             native = state.pop("native_normalized")
             video = native.to(torch.bfloat16).contiguous()
-            audio = pcm[:161333].transpose(0, 1).unsqueeze(0).clamp(-1, 1).contiguous()
+            audio = pcm.transpose(0, 1).unsqueeze(0).clamp(-1, 1).contiguous()
             if not bool(torch.isfinite(audio).all()):
                 raise RuntimeError("nonfinite native PCM")
             directory = Path(target["directory"])
@@ -94,7 +108,7 @@ def install_capture(worker):
                                   "normalization": "released_h3_per_channel_mean_std",
                                   "source": "original packed final latent unpatchified before VAE denormalize"},
                 "audio": {"shape": list(audio.shape), "dtype": str(audio.dtype), "sample_rate": 32000,
-                          "native_shape": list(pcm.shape), "temporal_trim": "first 161333 samples for 121-frame Stage2",
+                          "native_shape": list(pcm.shape), "temporal_trim": "none; all 165600 native samples (40Hz audio latent grid)",
                           "processing": "transpose TC to BCT; clamp [-1,1], original native PCM unchanged"},
                 "native_video_shape": None,
                 "latent_only_transfer": True,

@@ -27,6 +27,10 @@ def main():
     parser.add_argument("--options", type=Path, required=True)
     parser.add_argument("--ready", type=Path, required=True)
     args = parser.parse_args()
+    from spark_profile.exporting import write_records
+    from spark_profile.sol_state import PROFILES
+    profile = PROFILES[args.module]
+
     session = None
     started = time.monotonic_ns()
     try:
@@ -41,7 +45,11 @@ def main():
             if command["op"] not in ("run", "prepare", "release_idle_cache"):
                 raise ValueError("unsupported session operation")
             try:
-                result = getattr(session, command["op"])(**command["kwargs"])
+                response = Path(command["response"])
+                label = f"sol/{args.module}/{command['op']}/{response.stem}"
+                with profile.request(label) as recording:
+                    result = getattr(session, command["op"])(**command["kwargs"])
+                write_records(response.with_suffix(".spans.json"), recording.collect())
                 write_json(command["response"], {"status": "PASS", "result": result})
             except Exception as error:
                 write_json(command["response"], {

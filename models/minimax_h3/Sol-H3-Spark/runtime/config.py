@@ -10,7 +10,7 @@ PACKAGE = Path(__file__).resolve().parents[1]
 TASKS = ("t2va", "fl2va", "ref2va")
 REF_IMAGE_MATCH_CHOICES = ("stage1", "stage2")
 REF_STAGE1_ATTN_CHOICES = ("dense", "sol")
-FROZEN_RECIPE_SHA256 = "f3bec3ed9dee7bc92f6e936937dd1d5828852b4e485469c2e1d13727c4a41aab"
+FROZEN_RECIPE_SHA256 = "8a8eeb631954327b425fd8711ad886ce088713f8d8b941151f118143d8ae0c96"
 REQUIRED_PATHS = (
     "stage1_python", "stage2_python", "qwen_python", "h3_model", "vsa_lora",
     "fastvideo_root", "fa4_root", "ltx_root", "qwen_checkpoint", "comfy_root", "transformer",

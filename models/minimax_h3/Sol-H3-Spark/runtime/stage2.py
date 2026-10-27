@@ -6,7 +6,7 @@ post-connector AV cache. Original PCM is muxed into the final MP4.
 """
 from __future__ import annotations
 
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from copy import deepcopy
 from dataclasses import asdict
 import gc
@@ -23,12 +23,16 @@ from .stage2_ops.models import SIGMAS, TILES, construct, public_refiner_modules
 from .stage2_ops.conv_direct_nhwc import installed_direct_upsample_nhwc
 from .stage2_ops.writer_chunking import tracked_writer_chunks
 
+from .profiling import observed
+
 REQUIRED_PATHS = ("transformer", "refiner_lora", "output_video_vae", "audio_vae",
                   "adapter_dir", "h3_upscaler_source", "h3_upscaler_checkpoint", "prompt_cache")
 
 
 def _refiner_class(base, compat, session):
     torch = session.torch
+    from spark_profile.sol_state import PROFILES
+    profile = PROFILES["stage2"]
 
     class SparkRefiner(compat.OfficialCompatRefiner):
         def __init__(self):
@@ -52,7 +56,7 @@ def _refiner_class(base, compat, session):
         def prepare_input(self, source_path):
             return session.payload["h3_normalized"].to(self.device), {
                 "wire_metadata": dict(WIRE_METADATA), "transport": "same_request_H3_and_PCM",
-                "preprocess": "normalized_h3_x2_then_adapter_crop_t16",
+                "preprocess": "normalized_h3_x2_then_adapter_all_t17_then_crop_decoded129_to124",
                 "latent_upsampler": False}
 
         def video_encode(self, normalized):
@@ -66,19 +70,61 @@ def _refiner_class(base, compat, session):
             checked(normalized, H3_INPUT)
             self.h3_upscaler_calls += 1
             highres, self._h3_upscale_s = base._timed_cuda(
-                lambda: upscale_comfy_normalized_h3(self.h3_upscaler, normalized))
+                lambda: observed("module/h3_upscaler", upscale_comfy_normalized_h3)(
+                    self.h3_upscaler, normalized))
             checked(highres, H3_UPSCALED)
             self.adapter_convert_calls += 1
-            latent, self._h3_adapter_s = base._timed_cuda(lambda: self.h3_ltx_adapter.convert(
-                highres, pixel_frames=124, pixel_height=768, pixel_width=1344,
-                input_normalization="normalized"))
+            def convert_adapter():
+                return observed("module/h3_ltx_adapter", self.h3_ltx_adapter.convert)(
+                    highres, pixel_frames=124, pixel_height=768, pixel_width=1344,
+                    input_normalization="normalized")
+            if session.early_capture is not None or (os.environ.get("SPARK_CP_BRANCH_SCHEDULE", "0") == "1" and self.world_size > 1):
+                from .stage2_ops.branch_schedule import run_branches
+                if session.early_capture is not None and self.rank == 0:
+                    from .early_handoff import release_audio
+                    release_audio(session.early_capture, session.prepared["request_id"])
+                branches = run_branches(convert_adapter, lambda: self._encode_source_audio(None),
+                    ADAPTER_OUTPUT, tuple(int(v) for v in self.audio_tools.target_shape), self.device, self.dtype)
+                latent, self._pending_audio = branches.video, branches.audio
+                self._h3_adapter_s = branches.wall_seconds
+                if session.early_capture is not None:
+                    from .profiling import scope
+                    with scope("Spark/bridge/PCM_broadcast"):
+                        pcm = (session.payload["audio"].to(self.device) if self.rank == 0
+                               else torch.empty((1, 2, 165600), device=self.device, dtype=torch.float32))
+                        session.dist.broadcast(pcm, src=0)
+                        session.payload["audio"] = pcm.cpu()
+            else:
+                latent, self._h3_adapter_s = base._timed_cuda(convert_adapter)
+            if os.environ.get("SPARK_CP_AUDIO_VERIFY") == "1":
+                from .schedule_qualification import tensor_digest
+                write_new(Path(session.prepared["output_root"]) / "adapter-digest.json",
+                          {"sha256": tensor_digest(latent)})
             checked(latent, ADAPTER_OUTPUT)
-            return checked(latent[:, :, :16].contiguous(), REFINER_INPUT)
+            return checked(latent.contiguous(), REFINER_INPUT)
 
         def encode_source_audio(self, source_path):
+            pending = getattr(self, "_pending_audio", None)
+            if pending is not None:
+                self._pending_audio = None
+                return pending
+            return self._encode_source_audio(source_path)
+
+        def _encode_source_audio(self, source_path):
             from ltx_core.model.audio_vae import encode_audio
             from ltx_core.types import Audio
 
+            if session.early_capture is not None and self.rank == 0:
+                from .early_handoff import HandoffError, wait_ready
+                from .profiling import scope
+                with scope("Spark/bridge/wait_H3_PCM_and_trim"):
+                    wait_ready(session.early_capture / "manifest.json", session.prepared["request_id"])
+                    complete = load_latent_capture(session.early_capture,
+                                                   request_id=session.prepared["request_id"])
+                    original = load_payload(complete, torch_module=torch)
+                    if not torch.equal(session.payload["h3_normalized"], original["h3_normalized"]):
+                        raise HandoffError("early and complete H3 video differ")
+                    session.payload["audio"] = original["audio"]
             audio = Audio(waveform=session.payload["audio"].to(self.device), sampling_rate=32000)
             latent = encode_audio(audio, self.audio_encoder, None).to(device=self.device, dtype=self.dtype)
             expected = tuple(int(value) for value in self.audio_tools.target_shape)
@@ -88,7 +134,29 @@ def _refiner_class(base, compat, session):
             conformed = torch.zeros(expected, device=self.device, dtype=self.dtype)
             frames = min(int(latent.shape[2]), expected[2])
             conformed[:, :, :frames] = latent[:, :, :frames]
+            if os.environ.get("SPARK_CP_AUDIO_VERIFY") == "1":
+                from .schedule_qualification import tensor_digest
+                write_new(Path(session.prepared["output_root"]) / "audio-latent-digest.json",
+                          {"sha256": tensor_digest(conformed)})
             return conformed.contiguous()
+
+        def denoise_multimodal(self, video_state, audio_state, video_context, audio_context):
+            original_video = video_state
+            sharded = os.environ.get("SPARK_CP_SHARDED_STATE") == "1"
+            if sharded:
+                from .stage2_ops.sharded_state import partition_state
+                video_state = partition_state(video_state, self.rank, self.world_size)
+            video_state, audio_state = super().denoise_multimodal(
+                video_state, audio_state, video_context, audio_context)
+            if sharded:
+                from .stage2_ops.sharded_state import restore_state
+                video_state = restore_state(video_state, original_video)
+            if os.environ.get("SPARK_LTX_V2_QUALIFY") == "1" and session.completed_requests > 0:
+                from .profiling import scope
+                with scope("Spark/qualification/denoise_outputs"):
+                    torch.save({"video": video_state.latent.cpu(), "audio": audio_state.latent.cpu()},
+                        Path(session.prepared["output_root"]) / "denoise-outputs.pt")
+            return video_state, audio_state
 
         def _checked_attention_stats(self):
             stats = self.sol_attention.stats()
@@ -108,6 +176,11 @@ def _refiner_class(base, compat, session):
                 "emitted_chunks": 0, "frames": 0, "source_layouts": [], "complete": False}
             chunks = tracked_writer_chunks(chunks, session.writer_chunk_receipt,
                                            expected_dtype=torch.bfloat16)
+            if os.environ.get("SPARK_CP_AUDIO_VERIFY") == "1":
+                from .schedule_qualification import frame_digest, tensor_digest
+                chunks = frame_digest(iter(chunks), Path(session.prepared["output_root"]) / "frames.sha256")
+                write_new(Path(session.prepared["output_root"]) / "pcm-digest.json",
+                          {"sha256": tensor_digest(session.payload["audio"])})
             audio = base._normalize_audio(Audio(waveform=session.payload["audio"], sampling_rate=32000))
             temporary = output_path.with_name(f".{output_path.stem}.partial-{os.getpid()}.mp4")
             if temporary.exists() or output_path.exists():
@@ -130,6 +203,11 @@ def _refiner_class(base, compat, session):
             torch.cuda.synchronize()
             session.dist.barrier()
 
+    for name in ("prepare_input", "encode_prompt_multimodal", "video_encode",
+                 "encode_source_audio", "prepare_multimodal_states",
+                 "denoise_multimodal", "write_full_vae_video"):
+        setattr(SparkRefiner, name, observed(
+            f"module/ltx/{name}", getattr(SparkRefiner, name)))
     return SparkRefiner
 
 
@@ -143,6 +221,7 @@ class Session:
         self.closed = self.failed = False
         self.prepared = self.current_capture = self.payload = None
         self.completed_requests = 0
+        self.early_capture = None
         self.final_mp4_complete_monotonic_ns = None
         self.writer_chunk_receipt = None
         self.timings = {}
@@ -183,12 +262,15 @@ class Session:
         if not dist.is_initialized():
             dist.init_process_group("nccl")
             self._owns_dist = True
-        if dist.get_world_size() != 1:
-            raise RuntimeError("Spark requires one distributed rank")
+        if dist.get_world_size() != int(os.environ["SPARK_CP_WORLD"]):
+            raise RuntimeError("LTX world size must match the requested CP group")
         self.prompt_cache = load_cache(self.paths["prompt_cache"], prompt=self.fixed_prompt, torch_module=torch)
         base, compat = public_refiner_modules(self.ltx_root)
         with torch.inference_mode():
             self.models = _refiner_class(base, compat, self)()
+        from spark_profile.sol_state import PROFILES
+        self.models.transformer.forward = PROFILES["stage2"].wrap(
+            "module/ltx_dit", self.models.transformer.forward)
         self.conv_layout_receipt = self.stack.enter_context(installed_direct_upsample_nhwc(torch_module=torch))
         self.ready_ns = time.monotonic_ns()
         self.session_receipt = {"schema_version": 1, "status": "READY", "model_load_count": 1,
@@ -200,11 +282,14 @@ class Session:
             "actual_parameter_dtypes": self.models.parameter_dtypes,
             "stage2_gemma_loaded": False, "stage2_connector_loaded": False,
             "fixed_prompt_cache": self.prompt_cache.receipt(), "residency": self.models.residency,
+            "qkv_merged_modules": self.models.qkv_merged,
             "all2all_copy_elision": self.models.all2all_receipt,
             "denoiser_dummy_warmup": False, "latent_only_transfer": True}
         self.timings["startup_s"] = self.session_receipt["session_initialization_s"]
 
     def prepare(self, request_id, output_root):
+        from runtime.experiment_arm import apply_arm
+        apply_arm(request_id)
         started_ns = time.monotonic_ns()
         if self.closed or self.failed or self.prepared is not None or self.current_capture is not None:
             raise RuntimeError("prepare requires an idle session")
@@ -219,28 +304,59 @@ class Session:
         write_new(root / "stage2_prepare.json", self.prepared)
         return dict(self.prepared)
 
-    def run(self, capture_dir, output_root, request_id):
+    def run(self, capture_dir, output_root, request_id, early_handoff: bool = False):
         started_ns = time.monotonic_ns()
+        self.torch.cuda.reset_peak_memory_stats()
+        if os.environ.get("SPARK_LTX_V2_PAIR") == "1":
+            os.environ["SPARK_LTX_V2_MODE"] = "native" if request_id.startswith("native_") or request_id == "warmup_native" else "norm"
         root = Path(output_root).resolve()
         if (self.closed or self.failed or self.current_capture is not None or self.prepared is None
                 or self.prepared["request_id"] != request_id or self.prepared["output_root"] != str(root)):
             raise RuntimeError("run requires the matching completed prepare identity and output root")
-        receipt = {"status": "RUNNING", "request_id": request_id, "stage2_started_monotonic_ns": started_ns,
+        receipt = {"status": "RUNNING", "execution_variant": os.environ.get("SPARK_LTX_V2_MODE", "native"), "request_id": request_id, "stage2_started_monotonic_ns": started_ns,
             "request_index": self.completed_requests, "preparation": dict(self.prepared),
             "timing_boundary": "run_entry_after_prepare_to_atomic_final_muxed_MP4"}
         try:
-            row = load_latent_capture(capture_dir, request_id=request_id)
+            self.early_capture = None
+            if early_handoff:
+                from .early_handoff import load_video, local_capture
+                metadata, video = load_video(Path(capture_dir), request_id)
+                row = metadata.model_dump()
+                self.payload = {"h3_normalized": video}
+                self.early_capture = local_capture(Path(capture_dir))
+                receipt["schedule"] = "full_H3_audio_VAE_and_adapter_overlap"
+            else:
+                row = load_latent_capture(capture_dir, request_id=request_id)
+                self.payload = load_payload(row, torch_module=self.torch)
             self.current_capture = row
-            self.payload = load_payload(row, torch_module=self.torch)
             receipt.update(case_id=row["case_id"], capture=row)
             models = self.models
             before = models.h3_upscaler_calls, models.adapter_convert_calls, self.prompt_cache.context_calls
             layout_before = self.conv_layout_receipt["calls"]
-            output = root / "refined_1344x768_121f.mp4"
+            output = root / "refined_1344x768_124f.mp4"
             record = {"prompt_id": row["case_id"], "prompt": self.fixed_prompt, "seed": row["seed"],
                       "source_index": row["source_index"], "index": 0, "_source_path": "/dev/null"}
-            with self.torch.inference_mode():
+            fc2_before = None
+            if models.ltx_fc2_port is not None:
+                from .stage1_ops.fullopt_v2 import Mode, snapshot
+                fc2_before = snapshot(Mode.FC2)
+            trace = nullcontext()
+            if os.environ.get("SPARK_LTX_V2_DETAILS") == "1" and self.completed_requests > 0:
+                from .stage2_ops.spark_v2.profiling import detailed_trace
+                core = models.transformer.velocity_model
+                while hasattr(core, "model"):
+                    core = core.model
+                trace = detailed_trace(core, root / "linear-dispatch.json")
+            with self.torch.inference_mode(), trace:
                 result = models.run_diagnostic(record, output)
+            if fc2_before is not None:
+                from dataclasses import asdict
+                from .stage1_ops.fullopt_v2 import Mode, delta, snapshot
+                fc2_calls = delta(fc2_before, snapshot(Mode.FC2))
+                if fc2_calls.gemms != 144 or fc2_calls.quantizations != 144:
+                    raise RuntimeError(f"expected 144 actual LTX video FC2 GEMMs/quantizations, got {fc2_calls}")
+                receipt["ltx_fc2_port"] = models.ltx_fc2_port
+                receipt["ltx_fc2_actual_dispatch"] = asdict(fc2_calls)
             calls = tuple(a - b for a, b in zip((models.h3_upscaler_calls,
                 models.adapter_convert_calls, self.prompt_cache.context_calls), before))
             if calls != (1, 1, 1) or not self.writer_chunk_receipt["complete"]:
@@ -249,6 +365,8 @@ class Session:
             phases["fixed_prompt_context_copy_s"] = phases.pop("gemma_multimodal_embedding_s")
             phases["h3_upscale_and_adapter_s"] = phases.pop("official_input_video_vae_encode_s")
             phases.update(h3_latent_upscale_s=models._h3_upscale_s, h3_ltx_adapter_s=models._h3_adapter_s)
+            if early_handoff or (os.environ.get("SPARK_CP_BRANCH_SCHEDULE", "0") == "1" and models.world_size > 1):
+                phases["parallel_adapter_audio_s"] = phases.pop("h3_ltx_adapter_s")
             result["highres_first_frame"] = None
             result["spatial_route"] = {**models.h3_spatial_route,
                 "actual_calls": {"h3_upscaler": 1, "adapter": 1, "ltx_learned_x2": 0, "input_video_vae": 0}}
@@ -261,6 +379,12 @@ class Session:
                 stage2_gemma_loaded=False, stage2_connector_loaded=False,
                 fixed_prompt_cache=self.prompt_cache.receipt(), writer_chunking=deepcopy(self.writer_chunk_receipt),
                 conv_output_layout_request_calls=self.conv_layout_receipt["calls"] - layout_before)
+            if models.bridge_partition_receipt is not None:
+                receipt["bridge_partition"] = dict(models.bridge_partition_receipt)
+            if models.vae_partition_receipt is not None:
+                receipt["vae_partition"] = dict(models.vae_partition_receipt)
+            receipt["cuda_peak_allocated_bytes"] = self.torch.cuda.max_memory_allocated()
+            receipt["cuda_peak_reserved_bytes"] = self.torch.cuda.max_memory_reserved()
             self.timings.update(stage2_request_s=receipt["stage2_request_s"], phases_s=dict(phases))
             write_new(root / "final_file_manifest.json", {key: receipt[key] for key in (
                 "status", "request_id", "case_id", "output", "output_sha256", "output_bytes",
@@ -274,17 +398,22 @@ class Session:
             receipt.update(status="FAIL", error=f"{type(error).__name__}: {error}")
             raise
         finally:
-            self.current_capture = self.payload = self.prepared = None
+            self.current_capture = self.payload = self.prepared = self.early_capture = None
             write_new(root / "stage2_result.json", receipt)
 
-    def release_idle_cache(self, *, qwen_resident=True):
+    def release_idle_cache(self, *, qwen_resident=True, request_id="warmup"):
+        from runtime.experiment_arm import apply_arm
+        apply_arm(request_id)
         if self.closed or self.failed or self.current_capture is not None or self.prepared is not None:
             raise RuntimeError("cache release requires an idle session")
         started_ns = time.monotonic_ns()
-        gc.collect()
+        collect_cycles = not (qwen_resident and os.environ.get("SPARK_CP_SKIP_IDLE_GC", "0") == "1")
+        if collect_cycles:
+            gc.collect()
         self.torch.cuda.empty_cache()
         self.torch.cuda.synchronize()
-        return {"status": "PASS", "elapsed_s": (time.monotonic_ns() - started_ns) / 1e9}
+        return {"status": "PASS", "elapsed_s": (time.monotonic_ns() - started_ns) / 1e9,
+                "collected_cycles": collect_cycles}
 
     def close(self):
         if self.closed:

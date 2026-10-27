@@ -1,0 +1,57 @@
+{
+  "h3_revision": "090f41b83156ae61e6977e7d6069fd36b8fe584c",
+  "qualification": "TINY_SYNTHETIC_PASS_FULL_MODEL_REJECTED",
+  "files": [
+    {
+      "source": "h3-optimizations/flashinfer/flashinfer/cute_dsl/sparse/sm120_blk64/flash_fwd_sm120_sage.py",
+      "sha256_original": "82610c2ee6ae5c30b5864ca5851f70da6d49ed426d49c1ee4a917997039d5215",
+      "sha256_port": "82610c2ee6ae5c30b5864ca5851f70da6d49ed426d49c1ee4a917997039d5215"
+    },
+    {
+      "source": "h3-optimizations/flashinfer/flashinfer/cute_dsl/sparse/sm120_blk64/layout_utils.py",
+      "sha256_original": "a8581fbb2258595f0248232e5d115d988e0668df30c994106dde51e7df265dc5",
+      "sha256_port": "a8581fbb2258595f0248232e5d115d988e0668df30c994106dde51e7df265dc5"
+    },
+    {
+      "source": "h3-optimizations/flashinfer/flashinfer/cute_dsl/sparse/sm120_blk64/kernel_utils.py",
+      "sha256_original": "c9186ab14213c0631b6953b3d85421b236340e065f5850ce2def45277ea7327d",
+      "sha256_port": "c9186ab14213c0631b6953b3d85421b236340e065f5850ce2def45277ea7327d"
+    },
+    {
+      "source": "h3-optimizations/flashinfer/flashinfer/cute_dsl/sparse/sm120_blk64/batched_static_scheduler.py",
+      "sha256_original": "507a97c0eb8640f8107e59e95eacaf209fc9ca6bc90c11d9c0a231910622b658",
+      "sha256_port": "507a97c0eb8640f8107e59e95eacaf209fc9ca6bc90c11d9c0a231910622b658"
+    },
+    {
+      "source": "h3-optimizations/flashinfer/flashinfer/cute_dsl/sparse/bsa_utils/sage_quant_sm120.py",
+      "sha256_original": "3250a9c4f8bad713ae4e509262e8e2d983ddaa1e321a4ffe9345273872d9120b",
+      "sha256_port": "b7276c555a5035b29a81170ac26c8a9ddcfa7e3cc562aac0292d2b100a497dbe"
+    },
+    {
+      "source": "h3-optimizations/flashinfer/flashinfer/cute_dsl/sparse/bsa_utils/nvvm_compat.py",
+      "sha256_original": "b24af6f59e7cb00b01cadbe56263a655797e27dc2cd15c9b5b0161da756be1aa",
+      "sha256_port": "b24af6f59e7cb00b01cadbe56263a655797e27dc2cd15c9b5b0161da756be1aa"
+    },
+    {
+      "source": "h3-optimizations/flashinfer/flashinfer/cute_dsl/sparse/bsa_utils/cute_tensor_utils.py",
+      "sha256_original": "625eaa546ee45ad064983880327c7cd530086529b1bc66e19cd6067f1b999c8f",
+      "sha256_port": "625eaa546ee45ad064983880327c7cd530086529b1bc66e19cd6067f1b999c8f"
+    }
+  ],
+  "default_backend": "cudnn_bsa",
+  "actual_model": {
+    "status": "FAIL",
+    "call": 100,
+    "shape_bhsd": [
+      1,
+      56,
+      29952,
+      128
+    ],
+    "relative_l2": 0.08597731590270996,
+    "threshold": 0.08,
+    "max_abs": 516,
+    "selected_for_performance": false,
+    "evidence": "/home/scratch.georgel_gpu/proj-workspace/spark-h3/sol-engine/runs/h3-adopted-matched209-20261009/qualification/sage-full-model/pipeline/stage1-worker/worker.log"
+  }
+}

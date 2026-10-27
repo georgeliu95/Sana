@@ -66,16 +66,16 @@ from sol_attention import STAGE2_TAUS, Stage2DenseAttention, Stage2SolAttention
 WIDTH = 1344
 HEIGHT = 768
 FPS = 24.0
-SOURCE_WIDTH = 896
-SOURCE_HEIGHT = 512
+SOURCE_WIDTH = 672
+SOURCE_HEIGHT = 384
 try:
     SOURCE_FRAME_COUNT = int(os.environ.get("H3_LTX_SOURCE_FRAMES", "124"))
-    FRAME_COUNT = int(os.environ.get("H3_LTX_OUTPUT_FRAMES", "121"))
+    FRAME_COUNT = int(os.environ.get("H3_LTX_OUTPUT_FRAMES", "129"))
 except ValueError as exc:
     raise RuntimeError("H3_LTX source/output frame counts must be integers") from exc
-if (SOURCE_FRAME_COUNT, FRAME_COUNT) not in {(124, 121), (243, 241)}:
+if (SOURCE_FRAME_COUNT, FRAME_COUNT) != (124, 129):
     raise RuntimeError(
-        "H3_LTX frame profile must be 124->121 (5s) or 243->241 (10s)"
+        "matched benchmark frame profile must be 124->129 canvas, writer crops124"
     )
 LATENT_FRAME_COUNT = (FRAME_COUNT - 1) // 8 + 1
 WORLD_SIZE = 1
@@ -316,7 +316,7 @@ def _verify_video(path: Path) -> dict[str, Any]:
         raise FileNotFoundError(path)
     metadata = get_videostream_metadata(str(path))
     actual = (metadata.width, metadata.height, metadata.frames, float(metadata.fps))
-    expected = (WIDTH, HEIGHT, FRAME_COUNT, FPS)
+    expected = (WIDTH, HEIGHT, 124, FPS)
     if actual[:3] != expected[:3] or not math.isclose(actual[3], expected[3], rel_tol=0, abs_tol=1e-6):
         raise RuntimeError(f"invalid output video metadata: expected {expected}, got {actual}")
     return {

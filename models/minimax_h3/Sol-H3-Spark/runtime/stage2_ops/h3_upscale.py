@@ -24,7 +24,7 @@ MODEL_SYMBOLS = ("normalization", "zero_module", "AttnBlock3D", "ResBlockEmb3D",
 H3_INPUT = (1, 24, 37, 24, 42)
 H3_UPSCALED = (1, 24, 37, 48, 84)
 ADAPTER_OUTPUT = (1, 128, 17, 24, 42)
-REFINER_INPUT = (1, 128, 16, 24, 42)
+REFINER_INPUT = (1, 128, 17, 24, 42)
 
 
 def file_sha256(path):

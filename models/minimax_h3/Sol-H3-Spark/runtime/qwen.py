@@ -182,6 +182,11 @@ class Session:
         finally:
             utils.load_torch_file = original_load
         self.clip = self.owner.clip
+        from spark_profile.sol_state import PROFILES
+        from .profiling import observed
+        profile = PROFILES["qwen"]
+        self.clip.encode_from_tokens = observed("module/qwen_encode", profile.wrap("module/qwen_encode", self.clip.encode_from_tokens))
+        self.normalize = observed("module/qwen_normalize", profile.wrap("module/qwen_normalize", self.normalize))
         import comfy.model_management as management
         management.load_models_gpu([self.clip.patcher], force_full_load=True)
         self.clip.cond_stage_model.eval().requires_grad_(False)

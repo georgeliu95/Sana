@@ -9,6 +9,7 @@ import time
 
 from .config import PACKAGE, load_recipe
 from .worker import write_json
+from .profiling import scope, selected
 
 
 def await_json(path, process, timeout=1800):
@@ -34,7 +35,7 @@ def worker_environment(name, paths):
     # Downloads are a separate preparation step. No token is needed by inference.
     for key in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
         env.pop(key, None)
-    roots = [str(PACKAGE)]
+    roots = [str(PACKAGE), os.environ["SPARK_PROFILE_ROOT"]]
     if name == "stage1":
         if paths.get("fa4_dependencies"):
             roots.extend([paths["fa4_dependencies"],
@@ -156,10 +157,15 @@ class Pipeline:
         self.stage2 = self.worker_factory("stage2", self.root / "stage2-worker", self.paths, self.config)
         self.stage2.call("prepare", request_id="warmup", output_root=str(request / "stage2"))
         s2 = self.stage2.call(capture_dir=s1["capture_dir"], output_root=str(request / "stage2"), request_id="warmup")
-        self.stage2.call("release_idle_cache")
+        self.stage2.call("release_idle_cache", qwen_resident=False)
         self.qwen = self.worker_factory("qwen", self.root / "qwen-worker", self.paths, self.config)
+        permanent_qwen_warmed = os.environ.get("SPARK_CP_QWEN_WARMUP", "0") == "1"
+        if permanent_qwen_warmed:
+            self.qwen.call(case=warmup, output_root=str(request / "permanent-qwen"))
+            self.qwen.call("release_idle_cache")
         self.report.update(status="READY", startup_and_warmup_s=(time.monotonic_ns() - started) / 1e9,
-                           warmup={"case_id": case["case_id"], "seed": 999, "output": s2["output"]})
+                           warmup={"case_id": case["case_id"], "seed": 999, "output": s2["output"],
+                                   "permanent_qwen_warmed": permanent_qwen_warmed})
         self.save()
 
     def generate(self, case):
@@ -172,19 +178,35 @@ class Pipeline:
         row = {"case_id": case["case_id"], "seed": case["seed"], "task": self.task, "status": "RUNNING"}
         self.report["requests"].append(row)
         # This single parent clock includes fresh Qwen, scheduling, transfer and mux.
+        tracing = scope(f"Spark/request/{case['case_id']}/controller", capture=selected(case["case_id"]))
+        tracing.__enter__()
         started = time.monotonic_ns()
         row["request_start_monotonic_ns"] = started
         try:
-            self.stage2.call("release_idle_cache", qwen_resident=True)
+            self.stage2.call("release_idle_cache", qwen_resident=True, request_id=case["case_id"])
             conditioning = self.qwen.call(case=case, output_root=str(request / "qwen"))
             preparation = self.stage2.submit("prepare", request_id=case["case_id"],
                                              output_root=str(request / "stage2"))
-            s1 = self.stage1.call(case=case, conditioning_path=conditioning["conditioning_path"],
-                                  outputdir=str(request / "stage1"))
-            self.qwen.call("release_idle_cache")
-            self.stage2.wait(preparation)
-            s2 = self.stage2.call(capture_dir=s1["capture_dir"], output_root=str(request / "stage2"),
-                                  request_id=case["case_id"])
+            from .early_handoff import enabled, wait_ready
+            row["schedule"] = "full_audio_overlap" if enabled(case["case_id"]) else "reference"
+            if enabled(case["case_id"]):
+                pending_h3 = self.stage1.submit(case=case,
+                    conditioning_path=conditioning["conditioning_path"],
+                    outputdir=str(request / "stage1"))
+                wait_ready(request / "stage1/early_capture.json", case["case_id"], producer=pending_h3)
+                self.stage2.wait(preparation)
+                pending_ltx = self.stage2.submit(capture_dir=str(request / "stage1"),
+                    output_root=str(request / "stage2"), request_id=case["case_id"], early_handoff=True)
+                s1 = self.stage1.wait(pending_h3)
+                self.qwen.call("release_idle_cache")
+                s2 = self.stage2.wait(pending_ltx)
+            else:
+                s1 = self.stage1.call(case=case, conditioning_path=conditioning["conditioning_path"],
+                                      outputdir=str(request / "stage1"))
+                self.qwen.call("release_idle_cache")
+                self.stage2.wait(preparation)
+                s2 = self.stage2.call(capture_dir=s1["capture_dir"], output_root=str(request / "stage2"),
+                                      request_id=case["case_id"])
             ended = s2["final_mp4_complete_monotonic_ns"]
             if not started < ended <= time.monotonic_ns():
                 raise RuntimeError("Inconsistent same-host endpoint clocks")
@@ -202,6 +224,7 @@ class Pipeline:
             raise
         finally:
             self.save()
+            tracing.__exit__(None, None, None)
         return row
 
     def finish(self):

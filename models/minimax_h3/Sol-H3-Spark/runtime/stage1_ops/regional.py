@@ -1,6 +1,7 @@
 """Compile 52 native H3 regions around opaque SM121 VSA attention."""
 from types import MethodType, SimpleNamespace
 from typing import Optional
+from runtime.profiling import scope
 
 
 def install_dense(model, state):
@@ -83,7 +84,9 @@ def install(model, state, compile_kwargs=None):
         metadata = SimpleNamespace(variable_block_sizes=variable_sizes,
             num_prefix_tiles=prefix_tiles, num_video_tiles=video_tiles,
             VSA_sparsity=0.9, tile_elems=64, exempt=True, dense_layers=(), current_timestep=step)
-        result = body_originals[_layer_number(layer, 50)](q, k, v, gate, metadata)
+        index = _layer_number(layer, 50)
+        with scope(f'Spark/H3/attention/body/{index}/step/{step}'):
+            result = body_originals[index](q, k, v, gate, metadata)
         receipt["body_runtime_calls"] += 1
         return result.contiguous()
 
@@ -95,7 +98,9 @@ def install(model, state, compile_kwargs=None):
     def text_op(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer: torch.Tensor,
                 mask: Optional[torch.Tensor], is_causal: bool) -> torch.Tensor:
         metadata = SimpleNamespace(attn_mask=mask, is_causal=is_causal) if mask is not None else None
-        result = text_originals[_layer_number(layer, 2)](q, k, v, metadata)
+        index = _layer_number(layer, 2)
+        with scope(f'Spark/H3/attention/text/{index}'):
+            result = text_originals[index](q, k, v, metadata)
         receipt["text_runtime_calls"] += 1
         return result.contiguous()
 

@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import time
+from .profiling import observed, scope
 
 from .stage1_ops.lookup import install_exact_t2va_lookup, quantized_linear_name
 from .stage1_ops import native, vsa, sol
@@ -40,6 +41,8 @@ def validate_native_attention(before, after, *, require_calls=True):
 def install_worker(worker, task="t2va", attention=None, reference_area=None,
                    reference_budget_source=None):
     import torch
+    from spark_profile.sol_state import PROFILES
+    profile = PROFILES["stage1"]
     from fastvideo.pipelines.lazy_module import is_lazy_module
     from fastvideo.layers.lora.linear import BaseLayerWithLoRA
     from fastvideo.layers.linear import LinearBase
@@ -129,6 +132,9 @@ def install_worker(worker, task="t2va", attention=None, reference_area=None,
                 tagged.append(name)
         if not tagged or merged == 0:
             raise RuntimeError("missing real LoRA merge or native FP8 targets")
+        from .stage1_ops.fullopt_v2 import Mode, install
+        mode = Mode(os.environ.get('SPARK_V2_FC2', 'native'))
+        state['fullopt_v2_port'] = dataclasses.asdict(install(model, mode))
         convert_model_to_fp8(model)
         state.update(merged_lora_layers=merged, fp8_linears=len(tagged), fp8_linear_names=tagged,
                      fp8_weight_bytes=sum(m._fp8_weight.numel() for m in model.modules() if hasattr(m, "_fp8_weight")))
@@ -139,7 +145,8 @@ def install_worker(worker, task="t2va", attention=None, reference_area=None,
                 sol_route.start_forward()
             state["dit_active"] = True
             try:
-                return original_model_forward(*args, **kwargs)
+                with scope(f'Spark/H3/step/{(state['transformer_forwards'] - 1) % 4}'):
+                    return original_model_forward(*args, **kwargs)
             finally:
                 state["dit_active"] = False
         model.forward = observed_model_forward
@@ -153,6 +160,9 @@ def install_worker(worker, task="t2va", attention=None, reference_area=None,
         else:
             vsa.install_model(model, state)
             regional.install(model, state)
+        model.forward = observed("Spark/H3/DiT", model.forward)
+        for index, block in enumerate(model.transformer_blocks):
+            block.forward = observed(f"Spark/H3/body/{index}", block.forward)
         return model
     pipe.modules["transformer"].set_materialize_transform(quantize_after_merge)
     control.install_fa4_audit(worker)  # Native FA4 handles the two text-refiner blocks.
@@ -194,8 +204,18 @@ def install_worker(worker, task="t2va", attention=None, reference_area=None,
             stage._lazy_modules_to_release = tuple(m for m in stage._lazy_modules_to_release if id(m) not in keep)
         capture.install_capture(worker)
         capture.arm_capture(worker, state["case"]["target"])
+        for name, stage in pipe._stage_name_mapping.items():
+            stage.forward = observed(f"module/h3/{name}", profile.wrap(f"stage/h3/{name}", stage.forward))
         pipe.post_init = original_post_init
     pipe.post_init = post_init
+    original_pipe_forward = pipe.forward
+    def profile_forward(*args, **kwargs):
+        case_id = state["case"]["case"]["case_id"]
+        with profile.request(f"sol/stage1/gpu_worker/{case_id}") as recording:
+            result = original_pipe_forward(*args, **kwargs)
+        worker._spark_profile_recording = recording
+        return result
+    pipe.forward = profile_forward
     return {"status": "READY_FOR_FIRST_REQUEST"}
 
 
@@ -222,6 +242,8 @@ def arm_worker(worker, case, conditioning_path, outputdir):
     if worker.pipeline.post_init_called:
         capture.arm_capture(worker, target)
     result = {key: worker._sol_h3_stage1[key] for key in ("attention_calls", "conditioning_calls", "transformer_forwards")}
+    from .stage1_ops.fullopt_v2 import Mode, snapshot
+    worker._sol_h3_stage1['v2_fc2_before'] = dataclasses.asdict(snapshot(Mode(os.environ.get('SPARK_V2_FC2', 'native'))))
     result["vsa_snapshot"] = vsa.snapshot(worker._sol_h3_stage1) if task != "ref2va" else None
     return result
 
@@ -256,6 +278,16 @@ def finish_worker_request(worker):
                             else "DiT/audio VAE resident; video VAE never materialized"}
     if after["allocated_bytes"] != before["allocated_bytes"] or not cleanup["model_identities_unchanged"]:
         raise RuntimeError(f"inactive-cache trim unexpectedly changed active storage/models: {cleanup}")
+    from spark_profile.exporting import write_records
+    profile_output = Path(worker._sol_h3_stage1["case"]["target"]["directory"])
+    write_records(profile_output / "stage1-worker.spans.json",
+                  worker._spark_profile_recording.collect())
+    from .stage1_ops.fullopt_v2 import Mode, Counts, snapshot, delta
+    mode = Mode(os.environ.get('SPARK_V2_FC2', 'native'))
+    calls = delta(Counts(**worker._sol_h3_stage1['v2_fc2_before']), snapshot(mode))
+    if mode is not Mode.NATIVE and calls.gemms != 200:
+        raise RuntimeError(f'expected 200 real MXFP8 FC2 GEMMs per four-step request: {calls}')
+    worker._sol_h3_stage1['v2_fc2_actual_dispatch'] = dataclasses.asdict(calls)
     return {**{key: value for key, value in worker._sol_h3_stage1.items() if key != "case"},
             "inactive_cuda_cache_cleanup": cleanup}
 
@@ -279,7 +311,7 @@ class Session:
             Path(paths["fastvideo_root"]).expanduser().resolve(strict=True))
         profile = self.basic.parse_args([
             "--model-path", str(Path(paths["h3_model"]).expanduser().resolve(strict=True)),
-            "--prompt", "session", "--output", str(self.root), "--num-gpus", "1",
+            "--prompt", "session", "--output", str(self.root), "--num-gpus", os.environ["SPARK_CP_WORLD"],
             "--execution-backend", "mp", "--height", "384", "--width", "672",
             "--num-frames", "124", "--steps", "5", "--lazy-module-load",
             "--no-warmup", "--repeats", "1"])
@@ -299,6 +331,7 @@ class Session:
                 if (header.metadata() or {}).get("alpha") != "8":
                     raise RuntimeError("Ref2VA checkpoint must declare alpha8 metadata")
         profile.lora_strength = 1.0
+        profile.parallel_vae = False
         self.profile = profile
         # Make the fixed release route independent of inherited VSA selector flags.
         os.environ.update(FASTVIDEO_VSA_SM100A="0", FASTVIDEO_VSA_CUTEDSL="0",
@@ -345,7 +378,7 @@ class Session:
                 outputdir=str(outputdir)))[0]
             attention_before = self.rpc(native.read_fa4_audit)
             self.profile.prompt = case["prompt"]
-            output = outputdir / "native_384p.mp4"
+            output = outputdir / "native_256p.mp4"
             request = self.basic.build_request(self.profile, output, case["seed"])
             request = dataclasses.replace(request, inputs=native_inputs(case), output=dataclasses.replace(
                 request.output, save_video=False, return_frames=False))
@@ -375,6 +408,8 @@ class Session:
                     raise RuntimeError("regional call counts differ from native VSA")
                 regional["status"] = "PASS_RUNTIME_FULLGRAPH_AND_CALL_COUNTS"
             capture_path = outputdir / "capture.json"
+            from cp2_executor import share_capture
+            share_capture(capture_path)
             capture = json.loads(capture_path.read_text())
             if (capture["status"] != "PASS" or not capture["same_request"]
                     or capture["external_anchor_used"]
