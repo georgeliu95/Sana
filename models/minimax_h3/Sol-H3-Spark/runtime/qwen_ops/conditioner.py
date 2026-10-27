@@ -149,6 +149,10 @@ class MiniMaxNVFP4Conditioner:
                 f"{transformer_type.__module__}.{transformer_type.__name__}"
             )
         self.transformer = transformer
+        from .nvfp4_linear import install as install_fused_nvfp4_linear
+
+        self.fused_nvfp4_linears = install_fused_nvfp4_linear(transformer)
+        print(f"[sol-v2 qwen] fused NVFP4 linear on {self.fused_nvfp4_linears} modules", flush=True)
 
         patcher = self.clip.patcher
         expected = _device_key(DEVICE)
