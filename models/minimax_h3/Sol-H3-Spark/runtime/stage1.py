@@ -52,7 +52,7 @@ def install_worker(worker, task="t2va", attention=None, reference_area=None,
     state = {"task": task, "transformer_materializations": 0, "video_vae_materializations": 0,
              "conditioning_calls": 0, "attention_calls": 0, "compression_gates_unused": 0,
              "transformer_forwards": 0,
-             "fp8_route": "native_FastVideo_tensorwise_W8A8_after_original_BF16_LoRA_merge",
+             "fp8_route": "native_FastVideo_rowwise_W8A8_after_original_BF16_LoRA_merge",
              "qwen_builtin_materializations": 0, "case": None}
     worker._sol_h3_stage1 = state
     if task == "ref2va" and reference_area is not None:
@@ -128,7 +128,8 @@ def install_worker(worker, task="t2va", attention=None, reference_area=None,
         for name, module in model.named_modules():
             if isinstance(module, LinearBase) and quantized_linear_name(name):
                 module.quant_config = FP8Config()
-                module.quant_method = FP8QuantizeMethod("tensor")
+                # h3-rowwise: per-output-channel weights, per-token activations (sol_h3::fp8_rowwise_mm, CuTe on GB10)
+                module.quant_method = FP8QuantizeMethod("channel")
                 tagged.append(name)
         if not tagged or merged == 0:
             raise RuntimeError("missing real LoRA merge or native FP8 targets")
