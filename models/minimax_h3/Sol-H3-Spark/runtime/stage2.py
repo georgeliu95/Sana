@@ -238,7 +238,9 @@ class Session:
             if not path.is_file() or not path.stat().st_size:
                 raise FileNotFoundError(path)
         self.work_dir = Path(work_dir).resolve()
-        cache_root = self.work_dir / "compile"
+        # SOL_STAGE2_CACHE names a compile cache that outlives the run (under the per-run work directory every run
+        # compiled LTX from scratch).
+        cache_root = Path(os.environ["SOL_STAGE2_CACHE"]) if os.environ.get("SOL_STAGE2_CACHE") else self.work_dir / "compile"
         for env, part in (("TORCHINDUCTOR_CACHE_DIR", "inductor"), ("TRITON_CACHE_DIR", "triton")):
             directory = cache_root / part
             directory.mkdir(parents=True, exist_ok=True)
