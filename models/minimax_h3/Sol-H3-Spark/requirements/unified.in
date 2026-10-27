@@ -1,0 +1,84 @@
+# One environment for the whole Sol-H3-Spark v2 pipeline (Qwen worker, H3 stage1, LTX stage2), replacing the
+# image's system python (Qwen, NGC torch 2.10), sol-stage1 (torch 2.12.0+cu130) and sol-stage2 (torch 2.13.0+cu132).
+# Latest stable versions as of 2026-10-27; the union of both envs' packages plus ComfyUI's core requirements.
+# Not installed here, built against this torch from the sources of configs/dependencies.json (the FastVideo and
+# LTX-2 h3-spark-unified branches): fastvideo-kernel, ltx-core / ltx-pipelines / ltx-kernels (uv pip install
+# --no-build-isolation --no-deps, TORCH_CUDA_ARCH_LIST=12.1). FastVideo, FA4 and ComfyUI stay on PYTHONPATH.
+# Install this lock with: uv pip install --no-deps -r unified.lock (the lock is complete; torch's own CUDA pins
+# are overridden by overrides.txt).
+
+# CUDA 13.2 torch stack
+torch==2.14.1
+torchvision
+# torchaudio 2.11.0 (latest) +cu132 for aarch64 is only on the PyTorch test channel (PyPI's is cu130, rejected at import
+# by torch cu132); its extensions are stable-ABI (.abi3.so), as sol-stage2 used with torch 2.13
+torchaudio @ https://download.pytorch.org/whl/test/cu132/torchaudio-2.11.0%2Bcu132-cp312-cp312-manylinux_2_28_aarch64.whl
+triton
+nvidia-cudnn-frontend
+nvidia-cutlass-dsl[cu13]==4.8.1
+cuda-python
+apache-tvm-ffi
+# FA4 (the two H3 text-refiner blocks) dependencies, as its isolated fa4-post3-v1 set had them
+quack-kernels
+# CUDA 13.2 toolkit from pip, matching torch's runtime, for building fastvideo-kernel and ltx-kernels (as sol-stage2 did)
+nvidia-cuda-nvcc>=13.2,<13.3
+nvidia-cuda-cccl>=13.2,<13.3
+nvidia-cuda-crt>=13.2,<13.3
+nvidia-nvvm>=13.2,<13.3
+nvidia-cuda-nvdisasm>=13.2,<13.3
+cmake
+scikit-build-core
+setuptools
+wheel
+ninja
+
+# Model code (H3 stage1, LTX stage2)
+diffusers==0.42.0
+transformers==5.20.2
+accelerate
+safetensors
+huggingface-hub
+peft
+timm
+sentencepiece
+ftfy
+omegaconf
+loguru
+einops
+numpy
+pillow
+opencv-python-headless
+av
+imageio
+imageio-ffmpeg
+openimageio
+protobuf
+requests
+pydantic>=2
+# the rest of the union of sol-stage1 and sol-stage2 (cv2 comes from opencv-python-headless above)
+cloudpickle
+nvtx
+httpx
+six
+antlr4-python3-runtime
+remote-pdb
+
+# ComfyUI (Qwen worker), its requirements.txt at the pinned commit b1693ecb; comfy-kitchen / comfy-aimdo as pinned there
+torchsde
+tokenizers
+aiohttp
+yarl
+pyyaml
+scipy
+tqdm
+psutil
+alembic
+SQLAlchemy
+filelock
+comfy-kitchen==0.2.26
+comfy-aimdo==0.4.11
+simpleeval
+blake3
+kornia
+spandrel
+pydantic-settings

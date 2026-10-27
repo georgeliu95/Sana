@@ -1,0 +1,3 @@
+# torch pins exact CUDA library versions; take the newest instead (cuBLAS 13.8 fixes the PDL scale race CUB-10409).
+nvidia-cublas==13.8.1.7
+nvidia-cudnn-cu13==9.27.0.42

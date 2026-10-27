@@ -17,14 +17,16 @@
     {
       "key": "fastvideo_root",
       "directory": "FastVideo",
-      "repository": "https://github.com/hao-ai-lab/FastVideo.git",
-      "revision": "3d8ac9d14bd697a89ede8f170cbfbca012a9edcc",
-      "patch_manifest": "patches/fastvideo-spark-loader.json",
+      "repository": "https://github.com/georgeliu95/FastVideo.git",
+      "revision": "a48748d3259d02a154cfdd2e180afd86a06e677c",
       "license": "Apache-2.0",
       "python_packages": [
         ".",
         "fastvideo-kernel"
-      ]
+      ],
+      "branch": "h3-spark-unified",
+      "upstream": "https://github.com/hao-ai-lab/FastVideo.git@3d8ac9d14bd697a89ede8f170cbfbca012a9edcc",
+      "note": "patches/fastvideo-spark-loader.patch, the deployed profiling hook and the candidate attention layer are commits on this branch, followed by h3-scale, the eight-head qk-norm, rowwise FP8 and the C++20 build"
     },
     {
       "key": "fa4_source_root",
@@ -49,14 +51,17 @@
     {
       "key": "ltx_root",
       "directory": "LTX-2",
-      "repository": "https://github.com/Lightricks/LTX-2.git",
-      "revision": "d151147788a9284cca791edc6ce898007e727fe6",
+      "repository": "https://github.com/georgeliu95/LTX-2.git",
+      "revision": "cbc0744be37e49a8c9099ec4da966ec7632961a1",
       "license": "LTX Community License; see pinned LICENSE.md",
       "python_packages": [
         "packages/ltx-core",
         "packages/ltx-pipelines",
         "packages/ltx-kernels"
-      ]
+      ],
+      "branch": "h3-spark-unified",
+      "upstream": "https://github.com/Lightricks/LTX-2.git@d151147788a9284cca791edc6ce898007e727fe6",
+      "note": "the candidate's three overlay-v1 files, AdaLN on one row, the fused VAE decode and the C++20 build are commits on this branch"
     },
     {
       "key": "h3_upscaler_root",
@@ -99,6 +104,22 @@
       "comfy-aimdo": "0.4.11",
       "base_image": "nvcr.io/nvidia/pytorch:25.11-py3@sha256:417cbf33f87b5378849df37983552cd1f8bc8b62fe1ceabe004de816a55dff21",
       "note": "Recorded Qwen runtime uses a separate NGC environment; an interpreter must be executable by the pipeline's host process."
+    },
+    "unified": {
+      "python": "3.12",
+      "torch": "2.14.1+cu132",
+      "lock": "requirements/unified.lock",
+      "inputs": [
+        "requirements/unified.in",
+        "requirements/overrides.txt"
+      ],
+      "built_from_sources": [
+        "FastVideo/fastvideo-kernel",
+        "LTX-2/packages/ltx-core",
+        "LTX-2/packages/ltx-pipelines",
+        "LTX-2/packages/ltx-kernels"
+      ],
+      "note": "One environment for the Qwen worker, H3 and LTX (paths.json stage1_python, stage2_python and qwen_python all point at it), used by single_entry.py / single_process_entry.py. FA4 runs on this environment's cutlass-dsl / quack (no isolated set). Install the lock with uv pip install --no-deps, then build the four packages with --no-build-isolation --no-deps, TORCH_CUDA_ARCH_LIST=12.1 and CUDA_HOME at the pip CUDA 13.2 toolkit."
     }
   },
   "unresolved": [
