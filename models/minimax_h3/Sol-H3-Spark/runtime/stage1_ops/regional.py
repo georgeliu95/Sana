@@ -1,4 +1,10 @@
-"""Compile 52 native H3 regions around opaque SM121 VSA attention."""
+"""Compile 52 native H3 regions around opaque SM121 VSA attention.
+
+The denoising step reaches the opaque body op as a CPU scalar tensor, like the layer identity, instead of a Python
+int that the fullgraph regions guard on (`current_timestep == N`: one compiled graph per step, and the recompile
+limit reached at a second prompt length). The VSA forward does not read the step; it only names the profiling scope.
+"""
+import os
 from types import MethodType, SimpleNamespace
 from typing import Optional
 from runtime.profiling import scope
@@ -28,6 +34,13 @@ def _layer_number(tensor, count):
     if not 0 <= value < count:
         raise RuntimeError("regional identity is outside the installed model")
     return value
+
+
+def _step_number(tensor):
+    # Same CPU-scalar contract as the layer identity: read eagerly inside the opaque op, never in a region.
+    if tensor.device.type != "cpu" or tensor.ndim != 0:
+        raise RuntimeError("regional step must be a CPU scalar tensor")
+    return int(tensor.item())
 
 
 def install(model, state, compile_kwargs=None):
@@ -70,17 +83,49 @@ def install(model, state, compile_kwargs=None):
         raise RuntimeError("expected 50 actual VSA body layers and two original dense text layers")
     body_originals = [impl.forward for impl in bodies]
     text_originals = [impl.forward for impl in texts]
+    # The denoising loop builds the metadata outside the regions; attach the step there as a CPU scalar tensor.
+    from fastvideo.attention.backends import video_sparse_attn_h3 as vsa_backend
+    builder = vsa_backend.MiniMaxH3VSAMetadataBuilder
+    original_build = builder.build
+
+    def build(self, *args, **kwargs):
+        metadata = original_build(self, *args, **kwargs)
+        metadata._sol_h3_cpu_step = torch.tensor(metadata.current_timestep, device="cpu", dtype=torch.int64)
+        return metadata
+
+    builder.build = build
+    # Diagnostics for serving several prompt lengths in one process (default: torch's own settings). Dynamo's
+    # config overrides are ContextVars and FastVideo runs each forward in a fresh thread, so they are applied at
+    # the start of every forward call, where cp2_executor applies its own ablation limit.
+    knobs = {}
+    if os.environ.get("SOL_H3_RECOMPILE_LIMIT"):
+        knobs["recompile_limit"] = int(os.environ["SOL_H3_RECOMPILE_LIMIT"])
+    if os.environ.get("SOL_H3_STATIC_SHAPES") == "1":
+        knobs["automatic_dynamic_shapes"] = False
+    if knobs:
+        import cp2_executor
+        original_execute = cp2_executor.TorchrunExecutor.execute_forward
+
+        def execute_forward(self, *args, **kwargs):
+            for key, value in knobs.items():
+                setattr(torch._dynamo.config, key, value)
+            return original_execute(self, *args, **kwargs)
+
+        cp2_executor.TorchrunExecutor.execute_forward = execute_forward
     receipt = {"status": "INSTALLED_NOT_RUNTIME_VALIDATED", "selected_backend": backend,
         "boundary": "entire original VSA forward opaque; native projections/norm/FFN regions compile",
         "sparse_math_changed": False, "compression_gates_retained": 50,
         "layer_identity": "CPU int64 scalar Tensor; no GPU scalar read",
+        "step_identity": "CPU int64 scalar Tensor from the metadata builder; no per-step specialization",
+        "forward_thread_dynamo_config": knobs,
         "body_runtime_calls": 0, "text_runtime_calls": 0,
         "inner_vsa_compiled": False, "fullgraph": True}
 
     @torch.library.custom_op("sol_h3_spark_vsa::body", mutates_args=(), device_types="cuda")
     def body_op(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, gate: torch.Tensor,
                 variable_sizes: torch.Tensor, layer: torch.Tensor,
-                prefix_tiles: int, video_tiles: int, step: int) -> torch.Tensor:
+                prefix_tiles: int, video_tiles: int, step: torch.Tensor) -> torch.Tensor:
+        step = _step_number(step)
         metadata = SimpleNamespace(variable_block_sizes=variable_sizes,
             num_prefix_tiles=prefix_tiles, num_video_tiles=video_tiles,
             VSA_sparsity=0.9, tile_elems=64, exempt=True, dense_layers=(), current_timestep=step)
@@ -115,7 +160,7 @@ def install(model, state, compile_kwargs=None):
             raise RuntimeError("regional integration cannot change official tile64/prefix/sparsity/compression policy")
         return body_op(query, key, value, gate_compress, attn_metadata.variable_block_sizes,
             self._sol_h3_cpu_layer, attn_metadata.num_prefix_tiles,
-            attn_metadata.num_video_tiles, attn_metadata.current_timestep)
+            attn_metadata.num_video_tiles, attn_metadata._sol_h3_cpu_step)
 
     def text_forward(self, query, key, value, attn_metadata):
         return text_op(query, key, value, self._sol_h3_cpu_layer,
