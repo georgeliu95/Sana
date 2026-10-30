@@ -163,8 +163,11 @@ def _refiner_class(base, compat, session):
             stats.update(selected_backend=self.sol_backend, architecture="sm121-triton")
             expected = {"completed_steps": 3, "dense_calls": 3, "sol_calls": 141}
             kernel = stats.get("kernel", {})
-            if (any(stats.get(key) != value for key, value in expected.items())
-                    or kernel.get("kernel_calls") != 141 or kernel.get("dense_guard_calls") != 0
+            # v4 head-group pipeline: one kernel call per head group (141 x G), plus the calls of its in-run check.
+            kernel_calls = stats.get("sol_kernel_calls", 141)
+            if (any(stats.get(key) != value for key, value in expected.items()) or kernel_calls % 141
+                    or kernel.get("kernel_calls") != kernel_calls + stats.get("check_kernel_calls", 0)
+                    or kernel.get("dense_guard_calls") != 0
                     or kernel.get("hunyuan_calls") != 0 or self.sol_backend != "triton"):
                 raise RuntimeError(f"three-update Triton Sol contract failed: {stats}")
             return stats

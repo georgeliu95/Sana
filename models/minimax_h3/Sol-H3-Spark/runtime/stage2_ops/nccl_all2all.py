@@ -69,6 +69,26 @@ def gather_heads_fake(x: torch.Tensor, comm_id: int, world: int) -> torch.Tensor
     return x.new_empty((x.shape[0], x.shape[1] // world, x.shape[2] * world, x.shape[3]))
 
 
+@torch.library.custom_op("spark_cp::exchange_packed", mutates_args=())
+def exchange_packed(packed: torch.Tensor, comm_id: int, world: int) -> torch.Tensor:
+    """send_heads' collective alone, on a (world, B, T, H/world, D) tensor its caller packed (v4,
+    SPARK_CP_PACK_IN_GRAPH): outside this opaque op the pack is graph code, so Inductor writes it from the kernel that
+    produces the tensor (RMSNorm + RoPE for q and k) instead of a separate copy."""
+    comm = REGISTRY[comm_id]
+    if packed.ndim != 5 or packed.shape[0] != world or not packed.is_contiguous():
+        raise TransferContractError("exchange_packed expects a contiguous (world, B, T, H/world, D) tensor")
+    comm.check(packed.select(0, 0), packed.shape[2], packed.shape[3] * world)
+    with torch.cuda.nvtx.range("Spark/LTX/communication/AllToAll/exchange_packed"):
+        received = torch.empty_like(packed)
+        dist.all_to_all_single(received, packed, group=comm.group)
+        return received
+
+
+@exchange_packed.register_fake
+def exchange_packed_fake(packed: torch.Tensor, comm_id: int, world: int) -> torch.Tensor:
+    return packed.new_empty(packed.shape)
+
+
 class NCCLAll2All:
     """Own mutable sequence metadata; NCCL owns transport and watchdog timeout."""
 
@@ -109,6 +129,14 @@ class NCCLAll2All:
         if self.peer_exchange and self.world_size == 2 and x.shape[0] == 1:
             return send_heads_peer(x, self.comm_id, self.world_size)
         return send_heads(x, self.comm_id, self.world_size)
+
+    def send_recv_heads_packed(self, x: torch.Tensor) -> torch.Tensor:
+        """send_recv_heads with the pack as caller code (v4, SPARK_CP_PACK_IN_GRAPH); same values and layout."""
+        b, t, h, d = x.shape
+        world = self.world_size
+        packed = x.reshape(b, t, world, h // world, d).permute(2, 0, 1, 3, 4).contiguous()
+        received = exchange_packed(packed, self.comm_id, world)
+        return received.permute(1, 0, 2, 3, 4).reshape(b, world * t, h // world, d)
 
     def gather_heads(self, x: torch.Tensor, *, copy_out: bool = False) -> torch.Tensor:
         if self.world_size == 1:
