@@ -85,6 +85,8 @@ class Stage2SolAttention:
         self._step = -1
         self._dense_calls = 0
         self._sol_calls = 0
+        self._sol_kernel_calls = 0
+        self._check_kernel_calls = 0
         self._isolate_sol_from_compile = isolate_sol_from_compile
         self._blocks = tuple(_eager_block(block) for block in blocks)
         self._all2all_wrappers = tuple(
@@ -121,6 +123,9 @@ class Stage2SolAttention:
             all2all.original_attention = partial(
                 sol_call, layer_index, dense
             )
+            # v4 head-group pipeline (multigpu attention.py PipelinedAll2AllAttention): it calls this once per head
+            # group with part / parts; a layer still advances the schedule and counts once.
+            all2all.original_attention_accepts_parts = True
 
     def begin_denoise(self) -> None:
         """Reset the per-sample schedule and in-tree backend counters."""
@@ -130,6 +135,8 @@ class Stage2SolAttention:
         self._step = -1
         self._dense_calls = 0
         self._sol_calls = 0
+        self._sol_kernel_calls = 0
+        self._check_kernel_calls = 0
         reset_sol_attn_state()
 
     @staticmethod
@@ -151,8 +158,14 @@ class Stage2SolAttention:
         k: Any,
         v: Any,
         heads: int,
+        *,
+        part: int = 0,
+        parts: int = 1,
+        count: bool = True,
     ) -> Any:
-        if layer_index == 1:
+        # part / parts: the v4 head-group pipeline calls a layer once per head group; the schedule advances on the
+        # first group, the layer counts on the last. count=False: its in-run equality check (no counters at all).
+        if layer_index == 1 and part == 0 and count:
             next_step = self._step + 1
             if next_step >= len(STAGE2_TAUS):
                 raise RuntimeError(
@@ -190,7 +203,12 @@ class Stage2SolAttention:
             kv_splits="auto",
             dense_fn=partial(self._dense_bthd, dense),
         )
-        self._sol_calls += 1
+        if count:
+            self._sol_kernel_calls += 1
+            if part == parts - 1:
+                self._sol_calls += 1
+        else:
+            self._check_kernel_calls += 1
         return out.reshape(batch, tokens, hidden)
 
     def stats(self) -> dict[str, Any]:
@@ -216,6 +234,8 @@ class Stage2SolAttention:
             "dense_calls": self._dense_calls,
             "dense_calls_source": "inferred_from_layer1_entry_after_dense_layer0",
             "sol_calls": self._sol_calls,
+            "sol_kernel_calls": self._sol_kernel_calls,
+            "check_kernel_calls": self._check_kernel_calls,
             "kernel": get_sol_attn_stats(),
         }
 
