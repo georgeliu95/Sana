@@ -82,7 +82,10 @@ def reverse_active_indices(torch, indices, counts):
     return indices.gather(-1, gather_positions)
 
 
-def validate_request(before, after):
+def validate_request(before, after, pipeline=None):
+    """pipeline: this request's deltas of FastVideo's head-group pipeline counters (DistributedAttention_VSA.
+    pipeline_stats: calls, attention_calls, checks), None without it. A pipelined layer call runs the VSA forward
+    once per head group (plus once per in-run check), so every per-call counter scales with it."""
     if after is None or after.get("active_compression_gates") != 50:
         raise RuntimeError("actual official VSA installation/gates missing")
     first_materialization = before is None
@@ -100,16 +103,24 @@ def validate_request(before, after):
         raise RuntimeError("official VSA counter geometry changed")
     previous_bsa = before.get("cudnn_bsa_calls", 0)
     expected_reference = 200 if backend == "cudnn_bsa" and previous_bsa == 0 else 0
-    expected = dict(zip(COUNTERS, (200, 200, 200, 200 if backend == "triton" else 0,
-                                   2, 200 if backend == "cudnn_bsa" else 0, expected_reference)))
+    calls = 200
+    if pipeline and pipeline["calls"]:
+        if pipeline["calls"] != 200:
+            raise RuntimeError(f"head-group pipeline ran {pipeline['calls']} of the request's 200 VSA layer calls")
+        calls = pipeline["attention_calls"]
+    expected = dict(zip(COUNTERS, (calls, calls, calls, calls if backend == "triton" else 0,
+                                   2, calls if backend == "cudnn_bsa" else 0, expected_reference)))
     delta = {key: after.get(key, 0) - before.get(key, 0) for key in COUNTERS}
     per_layer = [a - b for a, b in zip(after["layer_calls"], before["layer_calls"])]
     per_step = [a - b for a, b in zip(after["step_calls"], before["step_calls"])]
-    if delta != expected or per_layer != [4] * 50 or per_step != [50] * 4:
+    # in-run checks run in the first calls of every layer only: then per-layer and per-step totals are not uniform
+    uniform = not (pipeline and pipeline["checks"])
+    if (delta != expected or sum(per_layer) != calls or sum(per_step) != calls
+            or (uniform and (per_layer != [calls // 50] * 50 or per_step != [calls // 4] * 4))):
         raise RuntimeError(f"real VSA request count mismatch: {delta}; layers={per_layer}; steps={per_step}")
     if backend == "cudnn_bsa":
         audit = after.get("warmup_selected_validation", {})
-        if (previous_bsa % 200 or audit.get("passed_calls") != WARMUP_REFERENCE_CALLS
+        if (0 < previous_bsa < WARMUP_REFERENCE_CALLS or audit.get("passed_calls") != WARMUP_REFERENCE_CALLS
                 or audit.get("status") != "PASS"
                 or after.get("warmup_reference_calls") != WARMUP_REFERENCE_CALLS):
             raise RuntimeError("first full warmup must validate all 200 actual BSA calls; later references forbidden")
@@ -118,7 +129,7 @@ def validate_request(before, after):
         match_order = order.get("match_triton_order", False)
         reorder_delta = order.get("metadata_reorder_calls", 0) - before_order.get("metadata_reorder_calls", 0)
         if (before_order.get("match_triton_order", match_order) != match_order
-                or reorder_delta != (200 if match_order else 0)):
+                or reorder_delta != (calls if match_order else 0)):
             raise RuntimeError("BSA active-index order/counter drift")
     bandwidth = after.get("bandwidth_optimization", {})
     previous_bandwidth = before.get("bandwidth_optimization", {})
@@ -129,13 +140,14 @@ def validate_request(before, after):
         bandwidth_delta = {key: bandwidth.get(key, 0) - previous_bandwidth.get(key, 0)
                            for key in ("bshd_selected_calls", "fused_merge_calls", "warmup_layout_copies")}
         if (backend != "cudnn_bsa" or not after["bsa_index_order"]["match_triton_order"]
-                or bandwidth_delta != {"bshd_selected_calls": 200, "fused_merge_calls": 200,
+                or bandwidth_delta != {"bshd_selected_calls": calls, "fused_merge_calls": calls,
                                        "warmup_layout_copies": 4 * expected_reference}):
             raise RuntimeError(f"VSA bandwidth optimized execution/copy boundary drift: {bandwidth_delta}")
     return {"status": "PASS", "first_materialization": first_materialization,
             "selected_attention_backend": backend,
             "request_counts": delta, "request_layer_calls": per_layer,
-            "request_step_calls": per_step, "request_attention_calls": 202,
+            "request_step_calls": per_step, "request_attention_calls": calls + 2,
+            "head_group_pipeline": pipeline,
             "active_compression_gates": 50, "observed_metadata": after["observed_metadata"],
             "count_boundary": "native forwards and actual selected backend entries, excluding fake/meta",
             "warmup_selected_validation": copy.deepcopy(after.get("warmup_selected_validation")),
@@ -201,6 +213,19 @@ def install_model(model, state, backend="cudnn_bsa"):
     bsa_forward = None
     match_triton_order = True
     bandwidth_opt = True
+    # FastVideo's head-group pipeline (h3-spark-rdma: SPARK_CP_H3_PIPELINE_GROUPS) calls each body forward once per
+    # group of a rank's heads. Its pooled-tile matmuls then get other cuBLAS kernels (fewer than 14 heads per call on
+    # GB10), so the output differs from the unpipelined one in low bits and H3, chaotic, ends as another sample.
+    # SPARK_CP_H3_PIPELINE_EXACT=1 (verification mode) batches them over all of the rank's heads
+    # (fused.heads_matmul): every group gets the unpipelined bits, about 0.7 ms per block slower. Default
+    # (production): the forward is not rewritten, nothing is added per call. Decided here, once.
+    from fastvideo.attention.layer import DistributedAttention_VSA
+    from fastvideo.distributed.parallel_state import get_sp_world_size
+    groups = getattr(DistributedAttention_VSA, "pipeline_stats", {}).get("groups", 1)
+    exact = groups > 1 and os.environ.get("SPARK_CP_H3_PIPELINE_EXACT", "0") == "1"
+    if groups > 1 and not exact and int(os.environ.get("SPARK_CP_H3_PIPELINE_CHECK", "0")) > 0:
+        raise RuntimeError("SPARK_CP_H3_PIPELINE_CHECK compares bits: it needs SPARK_CP_H3_PIPELINE_EXACT=1")
+    record["head_group_pipeline"] = {"groups": groups, "exact": exact}
     if bandwidth_opt and (backend != "cudnn_bsa" or not match_triton_order):
         raise RuntimeError("bandwidth optimized requires cuDNN BSA and verified Triton-order metadata")
     record["bandwidth_optimization"] = {
@@ -321,7 +346,8 @@ def install_model(model, state, backend="cudnn_bsa"):
                                   counts.to(torch.int32).contiguous(),
                                   block_sizes.to(torch.int32).contiguous(), _layout="bshd")
         # build_forward copies native globals: install counted_mask FIRST.
-        optimized_forward = fused_ops.build_forward(native, selected_bshd, bshd=True, fused_merge=True)
+        optimized_forward = fused_ops.build_forward(native, selected_bshd, bshd=True, fused_merge=True,
+                                                    matmul_heads=exact)
         original_merge = optimized_forward.__globals__["_optimized_merge"]
         def counted_merge(*args, **kwargs):
             result = original_merge(*args, **kwargs)
@@ -351,6 +377,13 @@ def install_model(model, state, backend="cudnn_bsa"):
             state["attention_calls"] += 1
             return result
         return observed
+    if exact:
+        if optimized_forward is None:
+            raise RuntimeError("SPARK_CP_H3_PIPELINE_EXACT needs the optimized forward's heads_matmul")
+        for module in model.modules():
+            if type(module).__name__ == "MiniMaxH3Attention" and module.to_gate_compress is not None:
+                module.distributed_attention.attn_impl._sol_h3_matmul_heads = (
+                    module.distributed_attention.num_heads // get_sp_world_size())
     for impl in bodies:
         original = (optimized_forward.__get__(impl, type(impl)) if optimized_forward is not None else impl.forward)
         impl.forward = body_forward(original, int(impl.layer_idx))

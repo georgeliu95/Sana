@@ -38,9 +38,34 @@ def validate_native_attention(before, after, *, require_calls=True):
              "resolved_precision_scope": "original constructor config; actual DiT converted to FP8 afterwards; Qwen external NVFP4"}]
 
 
+def pipeline_stats():
+    """FastVideo's head-group pipeline counters (h3-spark-rdma DistributedAttention_VSA), None without it."""
+    from fastvideo.attention.layer import DistributedAttention_VSA
+    stats = getattr(DistributedAttention_VSA, "pipeline_stats", None)
+    return dict(stats) if stats is not None else None
+
+
+def pipeline_delta(before, after):
+    """This request's head-group pipeline counts, None without the pipeline."""
+    if not before or not after:
+        return None
+    delta = {key: after[key] - before[key] for key in ("calls", "attention_calls", "checks")}
+    return {**delta, "groups": after["groups"], "transport": after["transport"]}
+
+
 def install_worker(worker, task="t2va", attention=None, reference_area=None,
                    reference_budget_source=None):
     import torch
+    if os.environ.get("SPARK_CP_H3_RDMA", "0") == "1":
+        # H3 head-group pipeline (FastVideo SPARK_CP_H3_PIPELINE_GROUPS > 1, 2 Sparks): its exchanges over RDMA from
+        # host-pinned buffers (ulysses_head_pipeline.spark_rdma) instead of NCCL; if the transport cannot be created
+        # on either rank, both keep NCCL. Port: rdma_cm, SPARK_CP_H3_RDMA_PORT and the next one (LTX's are 20411 and
+        # 20412).
+        from fastvideo.attention.layer import DistributedAttention_VSA
+        from ulysses_head_pipeline.spark_rdma import factory as spark_rdma_factory
+        DistributedAttention_VSA.pipeline_transport_factory = spark_rdma_factory(
+            chunk=int(os.environ.get("SPARK_CP_RDMA_CHUNK", str(1 << 20))),
+            port=int(os.environ.get("SPARK_CP_H3_RDMA_PORT", "20421")))
     from spark_profile.sol_state import PROFILES
     profile = PROFILES["stage1"]
     from fastvideo.pipelines.lazy_module import is_lazy_module
@@ -246,6 +271,7 @@ def arm_worker(worker, case, conditioning_path, outputdir):
     from .stage1_ops.fullopt_v2 import Mode, snapshot
     worker._sol_h3_stage1['v2_fc2_before'] = dataclasses.asdict(snapshot(Mode(os.environ.get('SPARK_V2_FC2', 'native'))))
     result["vsa_snapshot"] = vsa.snapshot(worker._sol_h3_stage1) if task != "ref2va" else None
+    result["vsa_pipeline"] = pipeline_stats()
     return result
 
 
@@ -290,7 +316,7 @@ def finish_worker_request(worker):
         raise RuntimeError(f'expected 200 real MXFP8 FC2 GEMMs per four-step request: {calls}')
     worker._sol_h3_stage1['v2_fc2_actual_dispatch'] = dataclasses.asdict(calls)
     return {**{key: value for key, value in worker._sol_h3_stage1.items() if key != "case"},
-            "inactive_cuda_cache_cleanup": cleanup}
+            "inactive_cuda_cache_cleanup": cleanup, "vsa_pipeline": pipeline_stats()}
 
 
 class Session:
@@ -389,7 +415,10 @@ class Session:
             actual = self.rpc(finish_worker_request)[0]
             attention_calls = actual["attention_calls"] - before["attention_calls"]
             forwards = actual["transformer_forwards"] - before["transformer_forwards"]
-            if (forwards != 4 or attention_calls != 202
+            # a head-group pipelined layer call runs the VSA forward once per group (vsa.validate_request)
+            pipeline = pipeline_delta(before.get("vsa_pipeline"), actual.get("vsa_pipeline"))
+            vsa_calls = pipeline["attention_calls"] if pipeline and pipeline["calls"] else 200
+            if (forwards != 4 or attention_calls != vsa_calls + 2
                     or actual["conditioning_calls"] - before["conditioning_calls"] != 1):
                 raise RuntimeError(f"four-update native H3 call count mismatch: {actual}")
             attention_actual = validate_native_attention(
@@ -401,7 +430,7 @@ class Session:
                     actual["sol_attention"] = sol.validate_request(actual["sol_attention"])
                 sparse_actual = None
             else:
-                sparse_actual = vsa.validate_request(before["vsa_snapshot"], actual["official_vsa"])
+                sparse_actual = vsa.validate_request(before["vsa_snapshot"], actual["official_vsa"], pipeline)
                 regional = actual["vsa_regional_compile"]
                 if (regional["body_runtime_calls"] != actual["official_vsa"]["vsa_forward_calls"]
                         or regional["text_runtime_calls"] != actual["official_vsa"]["dense_text_calls"]
@@ -425,7 +454,7 @@ class Session:
                 "capture_dir": str(outputdir), "capture_path": str(capture_path),
                 "native_fa4_audit": attention_actual, "official_vsa_actual": sparse_actual,
                 "request_transformer_forwards": forwards,
-                "request_attention_calls": attention_calls,
+                "request_attention_calls": attention_calls, "vsa_pipeline": pipeline,
                 "first_request_compile_included": not bool(before["transformer_forwards"]),
                 "conditioning_path": str(conditioning_path), "native_video_saved": False,
                 "latent_only_transfer": True,
