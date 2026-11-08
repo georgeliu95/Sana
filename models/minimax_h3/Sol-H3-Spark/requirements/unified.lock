@@ -449,3 +449,6 @@ yarl==1.25.1
     #   aiohttp
 zipp==4.1.2
     # via importlib-metadata
+
+# Shared fixed RDMA package (kept in a separate installable requirement).
+-r rdma.txt

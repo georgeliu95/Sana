@@ -18,7 +18,7 @@
       "key": "fastvideo_root",
       "directory": "FastVideo",
       "repository": "https://github.com/georgeliu95/FastVideo.git",
-      "revision": "a48748d3259d02a154cfdd2e180afd86a06e677c",
+      "revision": "cd1eee899dd1244649b9fb470a9b9281ed910102",
       "license": "Apache-2.0",
       "python_packages": [
         ".",
@@ -26,7 +26,7 @@
       ],
       "branch": "h3-spark-unified",
       "upstream": "https://github.com/hao-ai-lab/FastVideo.git@3d8ac9d14bd697a89ede8f170cbfbca012a9edcc",
-      "note": "patches/fastvideo-spark-loader.patch, the deployed profiling hook and the candidate attention layer are commits on this branch, followed by h3-scale, the eight-head qk-norm, rowwise FP8 and the C++20 build"
+      "note": "patches/fastvideo-spark-loader.patch, the deployed profiling hook and the candidate attention layer are commits on this branch, followed by h3-scale, the eight-head qk-norm, rowwise FP8 and the C++20 build; includes the qualified four-rank RDMA integration and the pinned installed Ulysses package dependency"
     },
     {
       "key": "fa4_source_root",
@@ -52,7 +52,7 @@
       "key": "ltx_root",
       "directory": "LTX-2",
       "repository": "https://github.com/georgeliu95/LTX-2.git",
-      "revision": "cbc0744be37e49a8c9099ec4da966ec7632961a1",
+      "revision": "5a80c61650ddfd1970f760e74388ca2718f83321",
       "license": "LTX Community License; see pinned LICENSE.md",
       "python_packages": [
         "packages/ltx-core",
@@ -61,7 +61,7 @@
       ],
       "branch": "h3-spark-unified",
       "upstream": "https://github.com/Lightricks/LTX-2.git@d151147788a9284cca791edc6ce898007e727fe6",
-      "note": "the candidate's three overlay-v1 files, AdaLN on one row, the fused VAE decode and the C++20 build are commits on this branch"
+      "note": "the candidate's three overlay-v1 files, AdaLN on one row, the fused VAE decode and the C++20 build are commits on this branch; includes the qualified four-rank RDMA integration and the pinned installed Ulysses package dependency"
     },
     {
       "key": "h3_upscaler_root",
@@ -111,7 +111,8 @@
       "lock": "requirements/unified.lock",
       "inputs": [
         "requirements/unified.in",
-        "requirements/overrides.txt"
+        "requirements/overrides.txt",
+        "requirements/rdma.txt"
       ],
       "built_from_sources": [
         "FastVideo/fastvideo-kernel",
@@ -119,7 +120,7 @@
         "LTX-2/packages/ltx-pipelines",
         "LTX-2/packages/ltx-kernels"
       ],
-      "note": "One environment for the Qwen worker, H3 and LTX (paths.json stage1_python, stage2_python and qwen_python all point at it), used by single_entry.py / single_process_entry.py. FA4 runs on this environment's cutlass-dsl / quack (no isolated set). Install the lock with uv pip install --no-deps, then build the four packages with --no-build-isolation --no-deps, TORCH_CUDA_ARCH_LIST=12.1 and CUDA_HOME at the pip CUDA 13.2 toolkit."
+      "note": "One environment for the Qwen worker, H3 and LTX (paths.json stage1_python, stage2_python and qwen_python all point at it), used by single_entry.py / single_process_entry.py. FA4 runs on this environment's cutlass-dsl / quack (no isolated set). Install the lock with uv pip install --no-deps, then build the four packages with --no-build-isolation --no-deps, TORCH_CUDA_ARCH_LIST=12.1 and CUDA_HOME at the pip CUDA 13.2 toolkit. The lock includes requirements/rdma.txt, which installs the shared Ulysses RDMA package at a fixed Git commit; do not copy that package into the demo or add a checkout to PYTHONPATH."
     }
   },
   "unresolved": [

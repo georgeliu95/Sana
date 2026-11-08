@@ -82,3 +82,6 @@ blake3
 kornia
 spandrel
 pydantic-settings
+
+# Shared fixed RDMA package (kept in a separate installable requirement).
+-r rdma.txt

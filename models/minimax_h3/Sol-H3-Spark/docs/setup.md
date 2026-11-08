@@ -1,13 +1,44 @@
 # Prepare the Spark runtime
 
-Use Linux aarch64 on a GB10/SM121 Spark. Preparation reuses separate Qwen,
-Stage1 and Stage2 environments. `requirements/*-observed.txt` records versions
-read from those environments; these files are inventories, not resolved pip
-lockfiles. A clean environment installation has not been validated.
+Use Linux aarch64 on a GB10/SM121 Spark. The current Sol v4.4 path uses one
+Python 3.12 environment for Qwen, H3 and LTX, described by
+`requirements/unified.lock` and `configs/dependencies.json`. The separate
+Stage1/Stage2 inventories and setup options below also support older runs.
+A clean full model environment installation has not been validated.
 
 Keep model preparation and inference outside scheduler login nodes. The
 filesystem-only commands below import no GPU framework. Model imports and
 cache generation belong on the GPU host or in a compute allocation.
+
+## Install the unified RDMA dependency
+
+From `Sol-H3-Spark`, install the same pinned package into every rank's unified
+environment. `unified.lock` includes this requirement for a fresh environment;
+the following command adds it to an already prepared environment:
+
+```bash
+uv pip install --python /absolute/unified-env/bin/python --no-deps -r requirements/rdma.txt
+```
+
+`--no-deps` preserves the environment's pinned Torch/CUDA stack. The requirement
+uses a full commit from NVIDIA GitLab over SSH, so GitLab access is required.
+For offline nodes, build a wheel from that exact revision on a connected
+machine, transfer it, and install with `uv pip install --no-deps /path/to/wheel`.
+The wheel contains the runtime C and NVTX header sources; gcc, rdma-core
+headers/libraries and optional NVTX SDK headers remain system dependencies.
+
+Do not deploy a second `ulysses_head_pipeline/` source directory alongside the
+entry point. Check from outside both repositories that imports resolve to the
+installed package:
+
+```bash
+cd /tmp
+/absolute/unified-env/bin/python -I -c 'import torch, ulysses_head_pipeline as p; print(p.__file__); assert not torch.cuda.is_initialized()'
+```
+
+RDMA transport creation still happens lazily on first use. Normal import does
+not allocate GPU or pinned transport memory. The package includes both the
+two-rank and four-rank paths; no Ulysses checkout belongs on `PYTHONPATH`.
 
 ## Inspect and download weights
 

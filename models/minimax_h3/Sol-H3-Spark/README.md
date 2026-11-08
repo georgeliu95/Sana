@@ -282,15 +282,23 @@ The four-rank path uses Gloo groups for CPU coordination and the external
 H3 and LTX both use `ulysses_head_pipeline.mesh.HeadGroupPipeline` with explicit
 RDMA transport; this deployment does not fall back to NCCL on transport errors.
 
-The dependency is supplied as Python source on `PYTHONPATH`, not installed by
-this repository's dependency manifest or managed as a Git submodule. Its source
-repository is `georgel/ulysses-head-pipeline` on NVIDIA GitLab. A deployment may
-mount that checkout on `PYTHONPATH`, or copy its `ulysses_head_pipeline/` package
-beside `cp4_entry.py`. The package must include the four-rank `mesh`,
-`collective_ops`, and `fused` modules; the older two-rank revision `2c85d5b` is
-insufficient. The four-rank dependency changes are maintained separately from
-these integration commits and must be supplied with the deployment. Preserve
-the exact dependency source hashes in the DiffusionLab declaration.
+The dependency is installed as the `ulysses-head-pipeline` Python package,
+pinned to a full Git commit in [requirements/rdma.txt](requirements/rdma.txt).
+Both `requirements/unified.in` and `requirements/unified.lock` include that
+file; FastVideo and LTX-Core declare the same dependency in their package
+metadata. Source repository: NVIDIA GitLab `georgel/ulysses-head-pipeline`,
+branch `h3-spark-unified`.
+
+```bash
+uv pip install --python /absolute/unified-env/bin/python --no-deps -r requirements/rdma.txt
+```
+
+Install into the unified Python environment on every rank. Normal imports
+resolve from `site-packages`; deployment no longer needs a copied
+`ulysses_head_pipeline/` directory or a `PYTHONPATH` entry for it. Omit any old
+same-named source copy from the deployment so it cannot shadow the installed
+package. See [setup](docs/setup.md#install-the-unified-rdma-dependency) for
+installation and offline-wheel instructions.
 
 The native transport is compiled from `spark_rdma.c` on first use and cached by
 source/build configuration hash. It requires `cuda-python`, gcc, rdma-core
