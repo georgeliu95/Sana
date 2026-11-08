@@ -126,6 +126,12 @@ class Stage2SolAttention:
             # v4 head-group pipeline (multigpu attention.py PipelinedAll2AllAttention): it calls this once per head
             # group with part / parts; a layer still advances the schedule and counts once.
             all2all.original_attention_accepts_parts = True
+            from runtime.stage2_ops.pipeline_io import FusionSettings, PipelineFusion
+            fusion_settings = FusionSettings.from_environment()
+            if fusion_settings.input or fusion_settings.output:
+                all2all.pipeline_fusion = PipelineFusion(all2all.original_attention, fusion_settings,
+                    {"pipeline_calls": 0, "input_calls": 0, "output_calls": 0})
+
 
     def begin_denoise(self) -> None:
         """Reset the per-sample schedule and in-tree backend counters."""
@@ -138,6 +144,10 @@ class Stage2SolAttention:
         self._sol_kernel_calls = 0
         self._check_kernel_calls = 0
         reset_sol_attn_state()
+        for wrapper in self._all2all_wrappers:
+            fusion = getattr(wrapper, "pipeline_fusion", None)
+            if fusion is not None:
+                fusion.reset()
 
     @staticmethod
     def _dense_bthd(dense: Callable[..., Any], q: Any, k: Any, v: Any) -> Any:
@@ -162,6 +172,9 @@ class Stage2SolAttention:
         part: int = 0,
         parts: int = 1,
         count: bool = True,
+        pipeline_gathered=None,
+        pipeline_targets=None,
+        pipeline_summaries=None,
     ) -> Any:
         # part / parts: the v4 head-group pipeline calls a layer once per head group; the schedule advances on the
         # first group, the layer counts on the last. count=False: its in-run equality check (no counters at all).
@@ -194,22 +207,27 @@ class Stage2SolAttention:
         q_bthd = q.view(batch, tokens, heads, head_dim).contiguous()
         k_bthd = k.view(batch, k.shape[1], heads, head_dim).contiguous()
         v_bthd = v.view(batch, v.shape[1], heads, head_dim).contiguous()
-        out = _run_sol_attn_bthd(
-            q_bthd,
-            k_bthd,
-            v_bthd,
-            tau=STAGE2_TAUS[self._step],
-            thresh_type="diag",
-            kv_splits="auto",
-            dense_fn=partial(self._dense_bthd, dense),
-        )
+        if pipeline_gathered is not None:
+            from techniques.sparse_backends.sol_attn_backend import _run_sol_attn_pipeline
+            out = _run_sol_attn_pipeline(pipeline_gathered, tau=STAGE2_TAUS[self._step],
+                                        targets=pipeline_targets, summaries=pipeline_summaries)
+        else:
+            out = _run_sol_attn_bthd(
+                q_bthd,
+                k_bthd,
+                v_bthd,
+                tau=STAGE2_TAUS[self._step],
+                thresh_type="diag",
+                kv_splits="auto",
+                dense_fn=partial(self._dense_bthd, dense),
+            )
         if count:
             self._sol_kernel_calls += 1
             if part == parts - 1:
                 self._sol_calls += 1
         else:
             self._check_kernel_calls += 1
-        return out.reshape(batch, tokens, hidden)
+        return None if out is None else out.reshape(batch, tokens, hidden)
 
     def stats(self) -> dict[str, Any]:
         """Return adapter and backend counters for per-rank validation."""
@@ -236,6 +254,11 @@ class Stage2SolAttention:
             "sol_calls": self._sol_calls,
             "sol_kernel_calls": self._sol_kernel_calls,
             "check_kernel_calls": self._check_kernel_calls,
+            "pipeline_fusion": {
+                key: sum(getattr(wrapper, "pipeline_fusion").audit[key] for wrapper in self._all2all_wrappers
+                         if getattr(wrapper, "pipeline_fusion", None) is not None)
+                for key in ("pipeline_calls", "input_calls", "output_calls")
+            },
             "kernel": get_sol_attn_stats(),
         }
 

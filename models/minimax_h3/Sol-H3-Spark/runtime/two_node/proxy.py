@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Final, Literal, final
 from runtime.early_handoff import capture_files
 from runtime.profiling import scope
 from .protocol import Command, receive_response, send_command
+from .paths import HandoffPaths
 from .wire import receive_file, send_bytes
 
 if TYPE_CHECKING:
@@ -39,6 +40,7 @@ class RemoteWorker:
 
     def __init__(self, root: Path) -> None:
         self.root = root
+        self.paths = HandoffPaths.from_environment()
         self.root.mkdir()
         self.stack = ExitStack()
         self.sock = self.stack.enter_context(
@@ -55,7 +57,7 @@ class RemoteWorker:
             Command(
                 op="open",
                 token=self.token,
-                kwargs={"work_dir": str(root / "model")},
+                kwargs=dict(self.paths.command_kwargs({"work_dir": str(root / "model")})),
             ),
         )
         self.ready = receive_response(self.sock).model_dump()
@@ -68,7 +70,7 @@ class RemoteWorker:
     ) -> Pending:
         """Send control and same-request tensors before returning the pending handle."""
         start = time.monotonic_ns()
-        send_command(self.sock, Command(op=op, token=self.token, kwargs=kwargs))
+        send_command(self.sock, Command(op=op, token=self.token, kwargs=dict(self.paths.command_kwargs(kwargs))))
         count, transfer_s = 0, 0.0
         if op == "run":
             captured = Path(str(kwargs["capture_dir"]))
@@ -91,10 +93,11 @@ class RemoteWorker:
             with scope('Spark/transfer/MP4_return_verify_write'):
                 size = receive_file(
                     self.sock,
-                    Path(response.artifact.path),
+                    Path(self.paths.to_local(response.artifact.path)),
                     response.artifact.sha256,
                 )
             endpoint = time.monotonic_ns()
+            result["output"] = self.paths.to_local(response.artifact.path)
             result["remote_final_mp4_complete_monotonic_ns"] = result[
                 "final_mp4_complete_monotonic_ns"
             ]

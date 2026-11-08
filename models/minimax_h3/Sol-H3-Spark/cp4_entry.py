@@ -133,7 +133,7 @@ def main() -> None:
         recipe["stage1"]["sequence_parallel_degree"] = dist.get_world_size()
         recipe["stage2"]["sequence_parallel_degree"] = dist.get_world_size()
         recipe["stage2"]["single_gpu_all2all"] = dist.get_world_size() == 1
-        recipe["stage2"]["communication"] = "NCCL"
+        recipe["stage2"]["communication"] = "RDMA"
         return recipe
     pipeline.load_recipe = distributed_recipe
     pipeline.worker_environment = environment

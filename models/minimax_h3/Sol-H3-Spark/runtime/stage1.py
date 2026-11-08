@@ -57,15 +57,12 @@ def install_worker(worker, task="t2va", attention=None, reference_area=None,
                    reference_budget_source=None):
     import torch
     if os.environ.get("SPARK_CP_H3_RDMA", "0") == "1":
-        # H3 head-group pipeline (FastVideo SPARK_CP_H3_PIPELINE_GROUPS > 1, 2 Sparks): its exchanges over RDMA from
-        # host-pinned buffers (ulysses_head_pipeline.spark_rdma) instead of NCCL; if the transport cannot be created
-        # on either rank, both keep NCCL. Port: rdma_cm, SPARK_CP_H3_RDMA_PORT and the next one (LTX's are 20411 and
-        # 20412).
+        # Pair ports occupy twelve consecutive values for four ranks; H3 and LTX use separate ranges.
         from fastvideo.attention.layer import DistributedAttention_VSA
-        from ulysses_head_pipeline.spark_rdma import factory as spark_rdma_factory
+        from ulysses_head_pipeline.mesh import rdma_factory as spark_rdma_factory
         DistributedAttention_VSA.pipeline_transport_factory = spark_rdma_factory(
             chunk=int(os.environ.get("SPARK_CP_RDMA_CHUNK", str(1 << 20))),
-            port=int(os.environ.get("SPARK_CP_H3_RDMA_PORT", "20421")))
+            port=int(os.environ.get("SPARK_CP_H3_RDMA_PORT", "21000")))
     from spark_profile.sol_state import PROFILES
     profile = PROFILES["stage1"]
     from fastvideo.pipelines.lazy_module import is_lazy_module

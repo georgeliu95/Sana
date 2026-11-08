@@ -56,6 +56,9 @@ def _forward_tma(
     BV: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
+    D0=None, D1=None, D2=None, D3=None,
+    SHARD: tl.constexpr = 0,
+    OUTPUT_SLOTS: tl.constexpr = False,
 ):
     v_tile, q_block, batch_head = (
         tl.program_id(0),
@@ -168,10 +171,19 @@ def _forward_tma(
             )
             row_max = new_max
 
-    o_desc.store(
-        [batch, q_start, head, v_tile * BV],
-        (output / row_sum[:, None]).to(tl.bfloat16)[None, :, None, :],
-    )
+    if OUTPUT_SLOTS:
+        rows = q_start + tl.arange(0, BLOCK_SIZE)
+        dims = v_tile * BV + tl.arange(0, BV)
+        owner = rows // SHARD
+        dest = tl.where(owner == 0, D0, tl.where(owner == 1, D1, tl.where(owner == 2, D2, D3)))
+        offsets = ((rows % SHARD)[:, None] * H + head) * D + dims[None, :]
+        tl.store(dest[:, None] + offsets, (output / row_sum[:, None]).to(tl.bfloat16),
+                 (rows < T)[:, None] & (dims < D)[None, :])
+    else:
+        o_desc.store(
+            [batch, q_start, head, v_tile * BV],
+            (output / row_sum[:, None]).to(tl.bfloat16)[None, :, None, :],
+        )
 
 
 @triton.autotune(

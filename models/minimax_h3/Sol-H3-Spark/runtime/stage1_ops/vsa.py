@@ -143,6 +143,25 @@ def validate_request(before, after, pipeline=None):
                 or bandwidth_delta != {"bshd_selected_calls": calls, "fused_merge_calls": calls,
                                        "warmup_layout_copies": 4 * expected_reference}):
             raise RuntimeError(f"VSA bandwidth optimized execution/copy boundary drift: {bandwidth_delta}")
+    packed = bandwidth.get("merge_untile_enabled", False)
+    if previous_bandwidth.get("merge_untile_enabled", packed) != packed:
+        from .merge_untile import MergeContractError
+        raise MergeContractError("packed-output mode changed across a request")
+    if packed:
+        from .merge_untile import MergeContractError
+        output_fused = after.get("pipeline_io", {}).get("output_enabled", False)
+        for key in ("merge_untile_calls", "packed_postprocess_calls"):
+            expected_calls = 0 if key == "packed_postprocess_calls" and output_fused else calls
+            if bandwidth.get(key, 0) - previous_bandwidth.get(key, 0) != expected_calls:
+                raise MergeContractError(f"packed-output execution count drift: {key}")
+    io = after.get("pipeline_io", {})
+    prior_io = before.get("pipeline_io", {})
+    if io.get("output_enabled", False) or io.get("input_enabled", False):
+        expected_io = {"pipeline_calls": 200,
+                       "input_calls": calls if io.get("input_enabled", False) else 0,
+                       "output_calls": calls if io.get("output_enabled", False) else 0}
+        if any(io.get(k, 0) - prior_io.get(k, 0) != value for k, value in expected_io.items()):
+            raise RuntimeError("fused I/O runtime count mismatch")
     return {"status": "PASS", "first_materialization": first_materialization,
             "selected_attention_backend": backend,
             "request_counts": delta, "request_layer_calls": per_layer,
@@ -198,8 +217,10 @@ def install_model(model, state, backend="cudnn_bsa"):
                       "shape": list(weight.shape), "active": True})
     if len(bodies) != 50 or len(texts) != 2 or sorted(i.layer_idx for i in bodies) != list(range(50)):
         raise RuntimeError("expected original 50 VSA body blocks and two dense text blocks")
+    from .gate_layout import install as install_gate_layout
     record = {key: 0 for key in COUNTERS}
     record.update(active_compression_gates=50, gates=sorted(gates, key=lambda x: x["layer"]),
+                  gate_weight_layout=install_gate_layout(model),
                   selected_attention_backend=backend,
                   layer_calls=[0] * 50, step_calls=[0] * 4, observed_metadata={},
                   vsa_source=str(source), vsa_source_sha256=VSA_SOURCE_SHA,
@@ -222,14 +243,25 @@ def install_model(model, state, backend="cudnn_bsa"):
     from fastvideo.attention.layer import DistributedAttention_VSA
     from fastvideo.distributed.parallel_state import get_sp_world_size
     groups = getattr(DistributedAttention_VSA, "pipeline_stats", {}).get("groups", 1)
+    from .merge_untile import MergeContractError, enabled_from_environment
+    packed_output = enabled_from_environment()
+    from .pipeline_io import FusionSettings, PipelineFusion
+    io_settings = FusionSettings.from_environment()
+    if (io_settings.output or io_settings.input) and (not packed_output or get_sp_world_size() != 4):
+        raise MergeContractError("I/O fusion requires packed-output four-rank H3")
+    if packed_output and (not bandwidth_opt or groups != 2):
+        raise MergeContractError("packed merge is qualified only for the inference BSHD tile64 H3 G2 pipeline")
     exact = groups > 1 and os.environ.get("SPARK_CP_H3_PIPELINE_EXACT", "0") == "1"
     if groups > 1 and not exact and int(os.environ.get("SPARK_CP_H3_PIPELINE_CHECK", "0")) > 0:
         raise RuntimeError("SPARK_CP_H3_PIPELINE_CHECK compares bits: it needs SPARK_CP_H3_PIPELINE_EXACT=1")
     record["head_group_pipeline"] = {"groups": groups, "exact": exact}
+    record["pipeline_io"] = {"output_enabled": io_settings.output, "input_enabled": io_settings.input,
+        "input_calls": 0, "output_calls": 0, "pipeline_calls": 0}
     if bandwidth_opt and (backend != "cudnn_bsa" or not match_triton_order):
         raise RuntimeError("bandwidth optimized requires cuDNN BSA and verified Triton-order metadata")
     record["bandwidth_optimization"] = {
         "enabled": bandwidth_opt, "bshd_selected_calls": 0, "fused_merge_calls": 0,
+        "merge_untile_enabled": packed_output, "merge_untile_calls": 0, "packed_postprocess_calls": 0,
         "warmup_layout_copies": 0,
         "selected_layout": "bshd" if bandwidth_opt else "bhsd",
         "merge": "fused; BF16 product rounded before BF16 add" if bandwidth_opt else "original eager BF16",
@@ -337,6 +369,7 @@ def install_model(model, state, backend="cudnn_bsa"):
         return result
     native._build_block_mask = counted_mask
     optimized_forward = None
+    optimized_into = None
     if bandwidth_opt:
         from . import fused as fused_ops
         def selected_bshd(q, k, v, block_mask, block_sizes):
@@ -347,19 +380,30 @@ def install_model(model, state, backend="cudnn_bsa"):
                                   block_sizes.to(torch.int32).contiguous(), _layout="bshd")
         # build_forward copies native globals: install counted_mask FIRST.
         optimized_forward = fused_ops.build_forward(native, selected_bshd, bshd=True, fused_merge=True,
-                                                    matmul_heads=exact)
+                                                    matmul_heads=exact, packed_output=packed_output)
         original_merge = optimized_forward.__globals__["_optimized_merge"]
         def counted_merge(*args, **kwargs):
             result = original_merge(*args, **kwargs)
             record["bandwidth_optimization"]["fused_merge_calls"] += 1
+            if packed_output:
+                record["bandwidth_optimization"]["merge_untile_calls"] += 1
             return result
         optimized_forward.__globals__["_optimized_merge"] = counted_merge
+        if io_settings.output:
+            optimized_into = fused_ops.build_forward(native, selected_bshd, bshd=True, fused_merge=True,
+                matmul_heads=exact, packed_output=True, output_slots=True)
+            original_into_merge = optimized_into.__globals__["_optimized_merge"]
+            def counted_into_merge(out, gate, compressed, tile, mapping, destinations):
+                original_into_merge(out, gate, compressed, tile, mapping, destinations)
+                record["bandwidth_optimization"]["fused_merge_calls"] += 1
+                record["bandwidth_optimization"]["merge_untile_calls"] += 1
+            optimized_into.__globals__["_optimized_merge"] = counted_into_merge
         optimized_source = Path(fused_ops.__file__).resolve()
         record["bandwidth_optimization"].update(
             optimized_source=str(optimized_source),
             optimized_sha256=hashlib.sha256(optimized_source.read_bytes()).hexdigest())
     def body_forward(original, layer):
-        def observed(query, key, value, gate_compress, attn_metadata):
+        def observed(query, key, value, gate_compress, attn_metadata, destinations=None):
             if torch.compiler.is_compiling():
                 raise RuntimeError("SM121 official Triton VSA must retain native eager execution")
             meta = metadata_contract(attn_metadata, layer)
@@ -368,7 +412,8 @@ def install_model(model, state, backend="cudnn_bsa"):
             if bandwidth_opt and query.shape[1] != attn_metadata.variable_block_sizes.numel() * 64:
                 raise RuntimeError("bandwidth optimized requires logical tile64 transport; no SM100 partner branch")
             record["active_call_context"] = {"layer": layer, **meta}
-            result = original(query, key, value, gate_compress, attn_metadata)
+            result = (original(query, key, value, gate_compress, attn_metadata) if destinations is None else
+                      original(query, key, value, gate_compress, attn_metadata, destinations))
             record["vsa_forward_calls"] += 1
             record["compression_branch_calls"] += 1
             record["layer_calls"][layer] += 1
@@ -387,6 +432,19 @@ def install_model(model, state, backend="cudnn_bsa"):
     for impl in bodies:
         original = (optimized_forward.__get__(impl, type(impl)) if optimized_forward is not None else impl.forward)
         impl.forward = body_forward(original, int(impl.layer_idx))
+        if optimized_into is not None:
+            impl.forward_into = body_forward(optimized_into.__get__(impl, type(impl)), int(impl.layer_idx))
+        if io_settings.output or io_settings.input:
+            impl.pipeline_io = PipelineFusion(impl, io_settings, record["pipeline_io"])
+    if packed_output:
+        from types import MethodType
+        from .merge_untile import packed_postprocess
+        def postprocess_packed(self, output, metadata):
+            result = packed_postprocess(output, metadata)
+            record["bandwidth_optimization"]["packed_postprocess_calls"] += 1
+            return result
+        for impl in bodies:
+            impl.postprocess_output = MethodType(postprocess_packed, impl)
     def text_forward(original):
         def observed(*args, **kwargs):
             result = original(*args, **kwargs)

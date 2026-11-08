@@ -81,7 +81,7 @@ def heads_matmul(a, b, heads):
     return torch.matmul(_pad_heads(a, heads), _pad_heads(b, heads))[:, :h]
 
 
-def optimized_tree(source, *, bshd, fused_merge, matmul_heads=False):
+def optimized_tree(source, *, bshd, fused_merge, matmul_heads=False, packed_output=False, output_slots=False):
     """Replace only four layout assignments and/or final BF16 merge statement, and with ``matmul_heads`` route the
     two pooled-tile matmuls through heads_matmul(a, b, self._sol_h3_matmul_heads)."""
     counts = {"layout_qkv": 0, "layout_output": 0, "gate_merge": 0, "heads_matmul": 0}
@@ -111,11 +111,20 @@ def optimized_tree(source, *, bshd, fused_merge, matmul_heads=False):
                 node.value = ast.Name("out_bhsd", ast.Load())
                 counts["layout_output"] += 1
             elif fused_merge and name == "out" and "out_tiled +" in value:
+                arguments = [ast.Name(x, ast.Load()) for x in ("out", "logical_gate", "out_c", "tile_elems")]
+                if packed_output:
+                    arguments.append(ast.Attribute(ast.Name("attn_metadata", ast.Load()), "untile_combined_index", ast.Load()))
+                if output_slots:
+                    arguments.append(ast.Name("destinations", ast.Load()))
                 node.value = ast.Call(ast.Name("_optimized_merge", ast.Load()),
-                                      [ast.Name(x, ast.Load()) for x in ("out", "logical_gate", "out_c", "tile_elems")], [])
+                                      arguments, [])
                 counts["gate_merge"] += 1
             return node
     tree = Rewrite().visit(ast.parse(textwrap.dedent(source)))
+    if output_slots:
+        if not packed_output:
+            raise RuntimeError("output slots require packed merge")
+        tree.body[0].args.args.append(ast.arg(arg="destinations"))
     ast.fix_missing_locations(tree)
     expected = {"layout_qkv": 3 if bshd else 0, "layout_output": 1 if bshd else 0,
                 "gate_merge": 1 if fused_merge else 0, "heads_matmul": 2 if matmul_heads else 0}
@@ -124,7 +133,7 @@ def optimized_tree(source, *, bshd, fused_merge, matmul_heads=False):
     return tree
 
 
-def build_forward(native, selected, *, bshd=True, fused_merge=True, matmul_heads=False):
+def build_forward(native, selected, *, bshd=True, fused_merge=True, matmul_heads=False, packed_output=False, output_slots=False):
     """Return an unbound optimized forward; caller supplies the SAME index policy.
 
     selected signature remains (q,k,v,mask,block_sizes)->(out,lse), but uses
@@ -137,9 +146,19 @@ def build_forward(native, selected, *, bshd=True, fused_merge=True, matmul_heads
         raise RuntimeError("optimized requires verified native H3 VSA source")
     if os.environ.get("FASTVIDEO_VSA_SM100A", "0") != "0":
         raise RuntimeError("SM100A branch is outside this SM121 optimized")
-    namespace = dict(native.__dict__, _optimized_merge=fused_gate_merge,
+    merge = fused_gate_merge
+    if packed_output:
+        from .merge_untile import MergeContractError, fused_merge_untile
+        if not bshd or not fused_merge:
+            raise MergeContractError("packed output requires the existing BSHD fused compression route")
+        merge = fused_merge_untile
+    if output_slots:
+        from .pipeline_io import merge_untile_into
+        merge = merge_untile_into
+    namespace = dict(native.__dict__, _optimized_merge=merge,
                      block_sparse_attn_64_bhsd=selected, _heads_matmul=heads_matmul)
     source = inspect.getsource(native.MiniMaxH3VSAImpl.forward)
-    exec(compile(optimized_tree(source, bshd=bshd, fused_merge=fused_merge, matmul_heads=matmul_heads),
+    exec(compile(optimized_tree(source, bshd=bshd, fused_merge=fused_merge, matmul_heads=matmul_heads,
+                               packed_output=packed_output, output_slots=output_slots),
                  native.__file__ + ":bandwidth_optimized", "exec"), namespace)
     return namespace["forward"]

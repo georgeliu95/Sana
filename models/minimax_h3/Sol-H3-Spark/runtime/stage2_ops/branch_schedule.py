@@ -1,5 +1,6 @@
 """Execute independent adapter and audio encoder branches on separate ranks."""
 from __future__ import annotations
+from ulysses_head_pipeline import collective_ops as rdma_ops
 from collections.abc import Callable
 from dataclasses import dataclass
 import time
@@ -25,8 +26,8 @@ def run_branches(adapter: Callable[[], Tensor], audio: Callable[[], Tensor],
         video = adapter() if rank == 1 else torch.empty(video_shape, device=device, dtype=dtype)
         sound = audio() if rank == 0 else torch.empty(audio_shape, device=device, dtype=dtype)
         with torch.cuda.nvtx.range("Spark/bridge/adapter_latent_broadcast"):
-            dist.broadcast(video, src=1)
+            rdma_ops.broadcast(video, src=1)
         with torch.cuda.nvtx.range("Spark/bridge/audio_latent_broadcast"):
-            dist.broadcast(sound, src=0)
+            rdma_ops.broadcast(sound, src=0)
         torch.cuda.synchronize()
     return BranchResult(video, sound, time.perf_counter() - begin)

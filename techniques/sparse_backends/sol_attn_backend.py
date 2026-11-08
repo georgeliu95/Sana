@@ -170,6 +170,15 @@ def _run_sol_attn_bthd(
         return dense()
 
 
+def _run_sol_attn_pipeline(gathered, *, tau, targets=None, summaries=None):
+    """Run only the qualified pipeline path; failures must never silently fall back."""
+    _load_sol_attn()
+    from sol_attn.pipeline import forward
+    out = forward(gathered, float(tau), targets, summaries)
+    _SOL_STATS["kernel_calls"] += 1
+    return out
+
+
 _MORTON_CACHE: dict[tuple[int, int, int], tuple] = {}
 
 

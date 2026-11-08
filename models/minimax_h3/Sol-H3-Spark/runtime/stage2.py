@@ -5,6 +5,7 @@ consumes one same-request normalized H3/PCM bundle and the exact offline generic
 post-connector AV cache. Original PCM is muxed into the final MP4.
 """
 from __future__ import annotations
+from ulysses_head_pipeline import collective_ops as rdma_ops
 
 from contextlib import ExitStack, nullcontext
 from copy import deepcopy
@@ -92,7 +93,7 @@ def _refiner_class(base, compat, session):
                     with scope("Spark/bridge/PCM_broadcast"):
                         pcm = (session.payload["audio"].to(self.device) if self.rank == 0
                                else torch.empty((1, 2, 165600), device=self.device, dtype=torch.float32))
-                        session.dist.broadcast(pcm, src=0)
+                        rdma_ops.broadcast(pcm, src=0)
                         session.payload["audio"] = pcm.cpu()
             else:
                 latent, self._h3_adapter_s = base._timed_cuda(convert_adapter)
@@ -265,7 +266,7 @@ class Session:
         if tuple(torch.cuda.get_device_capability(0)) != (12, 1):
             raise RuntimeError("this release profile requires Spark SM121")
         if not dist.is_initialized():
-            dist.init_process_group("nccl")
+            dist.init_process_group("gloo")
             self._owns_dist = True
         if dist.get_world_size() != int(os.environ["SPARK_CP_WORLD"]):
             raise RuntimeError("LTX world size must match the requested CP group")

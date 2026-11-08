@@ -1,5 +1,6 @@
 """Cross-host BTHD redistribution for the original LTX sequence-parallel API."""
 from __future__ import annotations
+from ulysses_head_pipeline import collective_ops as rdma_ops
 
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -42,7 +43,7 @@ def send_heads(x: torch.Tensor, comm_id: int, world: int) -> torch.Tensor:
     with torch.cuda.nvtx.range("Spark/LTX/communication/AllToAll/send_heads"):
         packed = x.reshape(b, t, world, h // world, d).permute(2, 0, 1, 3, 4).contiguous()
         received = torch.empty_like(packed)
-        dist.all_to_all_single(received, packed, group=comm.group)
+        rdma_ops.all_to_all_single(received, packed, group=comm.group)
         return received.permute(1, 0, 2, 3, 4).reshape(b, world * t, h // world, d).contiguous()
 
 
@@ -60,7 +61,7 @@ def gather_heads(x: torch.Tensor, comm_id: int, world: int) -> torch.Tensor:
     with torch.cuda.nvtx.range("Spark/LTX/communication/AllToAll/gather_heads"):
         packed = x.reshape(b, world, total // world, h, d).permute(1, 0, 2, 3, 4).contiguous()
         received = torch.empty_like(packed)
-        dist.all_to_all_single(received, packed, group=comm.group)
+        rdma_ops.all_to_all_single(received, packed, group=comm.group)
         return received.permute(1, 2, 0, 3, 4).reshape(b, total // world, world * h, d).contiguous()
 
 
@@ -80,7 +81,7 @@ def exchange_packed(packed: torch.Tensor, comm_id: int, world: int) -> torch.Ten
     comm.check(packed.select(0, 0), packed.shape[2], packed.shape[3] * world)
     with torch.cuda.nvtx.range("Spark/LTX/communication/AllToAll/exchange_packed"):
         received = torch.empty_like(packed)
-        dist.all_to_all_single(received, packed, group=comm.group)
+        rdma_ops.all_to_all_single(received, packed, group=comm.group)
         return received
 
 
@@ -90,7 +91,7 @@ def exchange_packed_fake(packed: torch.Tensor, comm_id: int, world: int) -> torc
 
 
 class NCCLAll2All:
-    """Own mutable sequence metadata; NCCL owns transport and watchdog timeout."""
+    """Keep the legacy API name; CUDA payloads use the explicit RDMA adapter."""
 
     def __init__(self, rank: int, world_size: int, seqlen: int, hidden_dim: int,
                  num_sms: int, tensor_dtype: torch.dtype,
@@ -110,7 +111,7 @@ class NCCLAll2All:
     def set_rank_tokens(self, rank_num_tokens: list[int]) -> None:
         if (len(rank_num_tokens) != self.world_size or len(set(rank_num_tokens)) != 1
                 or not 0 < rank_num_tokens[0] <= self.seqlen):
-            raise TransferContractError("LTX NCCL transport requires uniform positive token shards")
+            raise TransferContractError("LTX RDMA transport requires uniform positive token shards")
         self.rank_tokens = rank_num_tokens[0]
 
     def set_timeout_seconds(self, seconds: float) -> None:
@@ -163,7 +164,7 @@ def nccl_all2all_factory() -> Iterator[Receipt]:
     import ltx_kernels
     original = ltx_kernels.All2All
     before = len(REGISTRY)
-    receipt: Receipt = {"backend": "NCCL", "world_size": dist.get_world_size(),
+    receipt: Receipt = {"backend": "RDMA", "world_size": dist.get_world_size(),
                         "instances": 0, "factory_restored": False}
     ltx_kernels.All2All = NCCLAll2All
     try:

@@ -1,5 +1,6 @@
 """Global original-tile VAE partitioning with calibrated Philox offsets."""
 from __future__ import annotations
+from ulysses_head_pipeline import collective_ops as rdma_ops
 
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -166,7 +167,7 @@ def install(decoder: ConvVideoDecoder) -> Receipt:
                 output = outputs.pop(index) if owner == rank else torch.empty(
                     rng_plan.shape, device=sample.device, dtype=rng_plan.dtype)
                 with torch.cuda.nvtx.range(f"Spark/LTX/communication/VAE_tile_broadcast/{index}/owner{owner}"):
-                    dist.broadcast(output, src=owner)
+                    rdma_ops.broadcast(output, src=owner)
                 receipt["broadcast_tiles"] += 1
                 index += 1
                 return output

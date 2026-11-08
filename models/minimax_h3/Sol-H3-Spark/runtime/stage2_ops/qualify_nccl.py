@@ -1,4 +1,4 @@
-"""Numerical qualification of real multi-host NCCL token/head redistribution."""
+"""Numerical qualification of real multi-host RDMA token/head redistribution."""
 from __future__ import annotations
 import json
 from pathlib import Path

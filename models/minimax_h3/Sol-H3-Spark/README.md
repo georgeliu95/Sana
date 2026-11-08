@@ -274,3 +274,67 @@ Built on MiniMax-H3, FastVideo/FastH3, LTX-2.5, Sol-Attn, ComfyUI and the
 LBH-123-AI H3 latent upscaler. See [third-party notices](THIRD_PARTY_NOTICES.md)
 for component provenance and terms. Model access permissions and licenses
 remain separate from the license of this integration code.
+
+## Four-Spark RDMA integration
+
+The four-rank path uses Gloo groups for CPU coordination and the external
+`ulysses_head_pipeline.collective_ops` adapter for CUDA tensor payloads.
+H3 and LTX both use `ulysses_head_pipeline.mesh.HeadGroupPipeline` with explicit
+RDMA transport; this deployment does not fall back to NCCL on transport errors.
+
+The dependency is supplied as Python source on `PYTHONPATH`, not installed by
+this repository's dependency manifest or managed as a Git submodule. Its source
+repository is `georgel/ulysses-head-pipeline` on NVIDIA GitLab. A deployment may
+mount that checkout on `PYTHONPATH`, or copy its `ulysses_head_pipeline/` package
+beside `cp4_entry.py`. The package must include the four-rank `mesh`,
+`collective_ops`, and `fused` modules; the older two-rank revision `2c85d5b` is
+insufficient. The four-rank dependency changes are maintained separately from
+these integration commits and must be supplied with the deployment. Preserve
+the exact dependency source hashes in the DiffusionLab declaration.
+
+The native transport is compiled from `spark_rdma.c` on first use and cached by
+source/build configuration hash. It requires `cuda-python`, gcc, rdma-core
+headers/libraries, `/dev/infiniband`, and unlimited memlock. GB10 payloads pass
+through pinned host buffers. `SPARK_RDMA_NVTX=1` enables native transfer ranges;
+RDMA progress threads are distinct from any memory monitoring policy.
+
+The qualified four-rank layout path uses these explicit options:
+
+```bash
+export SPARK_CP_H3_RDMA=1 SPARK_CP_RDMA=1 SPARK_RDMA_STRICT=1
+export SPARK_CP_H3_PIPELINE_GROUPS=2 SPARK_CP_H3_PIPELINE_UNEVEN=1
+export SPARK_CP_H3_PIPELINE_EXACT=1 SPARK_CP_PIPELINE_GROUPS=4
+export SPARK_CP_H3_GATE_COLUMN_MAJOR=1 SPARK_CP_H3_MERGE_UNTILE=1
+export SPARK_CP_H3_FUSE_INPUT=1 SPARK_CP_H3_FUSE_OUTPUT=1
+export SPARK_CP_PACK_IN_GRAPH=1 SPARK_CP_COALESCE_AUDIO_KV=1
+export SPARK_CP_LTX_FUSE_INPUT=1 SPARK_CP_LTX_FUSE_OUTPUT=1
+```
+
+Retain the base recipe's attention backend, bandwidth optimization, and compile
+settings. Select unused RDMA port ranges separately for the H3 and LTX process
+groups through `SPARK_RDMA_COLLECTIVE_PORT` and their pipeline transport ports;
+all ranks of a role must use matching settings. H3 input/output fusion requires
+four ranks, the two-group exact pipeline, and packed merge/untile output. LTX
+input summaries remain on the compute stream.
+
+### Shared-container handoff
+
+H3 and LTX use distinct result roots when sharing a container filesystem.
+Set H3's `SPARK_PP_RESULT_ROOT` to its own root and `SPARK_PP_REMOTE_ROOT` to
+LTX's root; set the LTX process's `SPARK_PP_RESULT_ROOT` to that LTX root.
+The proxy maps owned command paths to the LTX root and the completed MP4 back
+to the H3 root. Checksums and the return-and-write E2E boundary are preserved.
+When `SPARK_PP_REMOTE_ROOT` is absent, existing identical-root deployments keep
+the identity mapping.
+
+Run the portable regression tests from this directory:
+
+```bash
+PYTHONPATH="$PWD" FASTVIDEO_ROOT=/path/to/FastVideo \
+  python -m pytest runtime/two_node/test_wire.py \
+  runtime/two_node/test_boundaries.py runtime/two_node/test_handoff_paths.py \
+  tests/test_h3_gate_layout.py tests/test_h3_merge_untile_integration.py
+```
+
+The gate storage tests use CPU PyTorch. GPU/Inductor fusion and four-rank RDMA
+still require the matching deployment and per-layer exactness checks.

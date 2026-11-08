@@ -6,6 +6,7 @@
 # Imported by the pinned LTX runtime; see verify_async_all2all.py and README.md.
 """Overlap packing with separate NCCL exchanges; retain every in-flight buffer."""
 from __future__ import annotations
+from ulysses_head_pipeline import collective_ops as rdma_ops
 
 from dataclasses import dataclass
 
@@ -46,7 +47,7 @@ def exchange_separate_async(values: list[torch.Tensor],
         packed = value.reshape(batch, tokens, group.world, heads // group.world, head_dim)
         packed = packed.permute(2, 0, 1, 3, 4).contiguous()
         received = torch.empty_like(packed)
-        work = dist.all_to_all_single(received, packed, group=group.group, async_op=True)
+        work = rdma_ops.all_to_all_single(received, packed, group=group.group, async_op=True)
         if work is None:
             raise AsyncLaunchError("async_op=True returned no distributed Work handle")
         pending.append(PendingTransfer(packed, received, work))

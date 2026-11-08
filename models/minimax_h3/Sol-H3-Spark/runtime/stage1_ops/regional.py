@@ -82,6 +82,9 @@ def install(model, state, compile_kwargs=None):
     if len(texts) != 2 or [impl.layer_idx for impl in bodies] != list(range(50)):
         raise RuntimeError("expected 50 actual VSA body layers and two original dense text layers")
     body_originals = [impl.forward for impl in bodies]
+    packed_output = audit.get("bandwidth_optimization", {}).get("merge_untile_enabled", False)
+    output_fused = audit.get("pipeline_io", {}).get("output_enabled", False)
+    into_originals = [impl.forward_into for impl in bodies] if output_fused else []
     text_originals = [impl.forward for impl in texts]
     # The denoising loop builds the metadata outside the regions; attach the step there as a CPU scalar tensor.
     from fastvideo.attention.backends import video_sparse_attn_h3 as vsa_backend
@@ -113,12 +116,13 @@ def install(model, state, compile_kwargs=None):
 
         cp2_executor.TorchrunExecutor.execute_forward = execute_forward
     receipt = {"status": "INSTALLED_NOT_RUNTIME_VALIDATED", "selected_backend": backend,
+        "body_output_layout": "packed" if packed_output else "padded",
         "boundary": "entire original VSA forward opaque; native projections/norm/FFN regions compile",
         "sparse_math_changed": False, "compression_gates_retained": 50,
         "layer_identity": "CPU int64 scalar Tensor; no GPU scalar read",
         "step_identity": "CPU int64 scalar Tensor from the metadata builder; no per-step specialization",
         "forward_thread_dynamo_config": knobs,
-        "body_runtime_calls": 0, "text_runtime_calls": 0,
+        "body_runtime_calls": 0, "body_into_runtime_calls": 0, "text_runtime_calls": 0,
         "inner_vsa_compiled": False, "fullgraph": True}
 
     @torch.library.custom_op("sol_h3_spark_vsa::body", mutates_args=(), device_types="cuda")
@@ -139,6 +143,49 @@ def install(model, state, compile_kwargs=None):
     def body_fake(q, k, v, gate, variable_sizes, layer, prefix_tiles, video_tiles, step):
         return q.new_empty((*q.shape[:-1], v.shape[-1]))
 
+    if packed_output:
+        from .merge_untile import packed_fake, packed_metadata, packed_postprocess
+
+        @torch.library.custom_op("sol_h3_spark_vsa::body_packed", mutates_args=(), device_types="cuda")
+        def body_packed(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, gate: torch.Tensor,
+                        variable_sizes: torch.Tensor, mapping: torch.Tensor, layer: torch.Tensor,
+                        prefix_tiles: int, video_tiles: int, step: torch.Tensor) -> torch.Tensor:
+            metadata = packed_metadata(mapping, variable_sizes, prefix_tiles, video_tiles, _step_number(step))
+            index = _layer_number(layer, 50)
+            with scope(f'Spark/H3/attention/body/{index}/step/{metadata.current_timestep}'):
+                result = body_originals[index](q, k, v, gate, metadata)
+            result = packed_postprocess(result, metadata)
+            receipt["body_runtime_calls"] += 1
+            return result.contiguous()
+
+        @body_packed.register_fake
+        def body_packed_fake(q, k, v, gate, variable_sizes, mapping, layer, prefix_tiles, video_tiles, step):
+            return packed_fake(q, v, mapping)
+
+    if output_fused:
+        @torch.library.custom_op("sol_h3_spark_vsa::body_packed_into",
+                                mutates_args={"destinations"}, device_types="cuda")
+        def body_packed_into(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, gate: torch.Tensor,
+                             variable_sizes: torch.Tensor, mapping: torch.Tensor, layer: torch.Tensor,
+                             prefix_tiles: int, video_tiles: int, step: torch.Tensor,
+                             destinations: list[torch.Tensor]) -> None:
+            metadata = packed_metadata(mapping, variable_sizes, prefix_tiles, video_tiles, _step_number(step))
+            index = _layer_number(layer, 50)
+            with scope(f'Spark/H3/attention/body/{index}/step/{metadata.current_timestep}'):
+                into_originals[index](q, k, v, gate, metadata, destinations)
+            receipt["body_runtime_calls"] += 1
+            receipt["body_into_runtime_calls"] += 1
+
+        @body_packed_into.register_fake
+        def body_packed_into_fake(q, k, v, gate, variable_sizes, mapping, layer,
+                                  prefix_tiles, video_tiles, step, destinations):
+            return None
+
+        def forward_into(self, query, key, value, gate_compress, attn_metadata, destinations):
+            body_packed_into(query, key, value, gate_compress, attn_metadata.variable_block_sizes,
+                attn_metadata.untile_combined_index, self._sol_h3_cpu_layer, attn_metadata.num_prefix_tiles,
+                attn_metadata.num_video_tiles, attn_metadata._sol_h3_cpu_step, destinations)
+
     @torch.library.custom_op("sol_h3_spark_vsa::text", mutates_args=(), device_types="cuda")
     def text_op(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer: torch.Tensor,
                 mask: Optional[torch.Tensor], is_causal: bool) -> torch.Tensor:
@@ -158,6 +205,10 @@ def install(model, state, compile_kwargs=None):
                 or attn_metadata.exempt is not True or attn_metadata.dense_layers
                 or gate_compress is None):
             raise RuntimeError("regional integration cannot change official tile64/prefix/sparsity/compression policy")
+        if packed_output:
+            return body_packed(query, key, value, gate_compress, attn_metadata.variable_block_sizes,
+                attn_metadata.untile_combined_index, self._sol_h3_cpu_layer, attn_metadata.num_prefix_tiles,
+                attn_metadata.num_video_tiles, attn_metadata._sol_h3_cpu_step)
         return body_op(query, key, value, gate_compress, attn_metadata.variable_block_sizes,
             self._sol_h3_cpu_layer, attn_metadata.num_prefix_tiles,
             attn_metadata.num_video_tiles, attn_metadata._sol_h3_cpu_step)
@@ -170,6 +221,8 @@ def install(model, state, compile_kwargs=None):
         for index, impl in enumerate(entries):
             impl._sol_h3_cpu_layer = torch.tensor(index, device="cpu", dtype=torch.int64)
             impl.forward = MethodType(forward, impl)
+            if entries is bodies and output_fused:
+                impl.forward_into = MethodType(forward_into, impl)
     # Deliberately not prepare_for_regional_compile(): that hook probes SM100a.
     model.prepare_for_compile()
     enabled = fsdp_load._enable_regional_attention_compile(model)

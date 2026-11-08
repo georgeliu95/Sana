@@ -37,9 +37,9 @@ def main() -> None:
     from . import spmd
     from runtime.stage2_ops.qualify_nccl import qualify
     torch.cuda.set_device(0)
-    dist.init_process_group("nccl", timeout=timedelta(minutes=45))
+    dist.init_process_group("gloo", timeout=timedelta(minutes=45))
     group = dist.new_group(backend="gloo", timeout=timedelta(minutes=45))
-    qualify(root.parent / "ltx-nccl-qualification.json")
+    qualify(root.parent / "ltx-rdma-qualification.json")
     if dist.get_rank() != 0:
         spmd.follow(paths, config, root, group)
         dist.destroy_process_group()

@@ -1,5 +1,6 @@
 """Assign the author's existing two temporal segments to separate CP ranks."""
 from __future__ import annotations
+from ulysses_head_pipeline import collective_ops as rdma_ops
 
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -66,7 +67,7 @@ def install(model: Upscaler) -> Receipt:
             value = (outputs.pop(index) if rank == owner else
                      torch.empty((1, 24, stop - start, 48, 84), device=x.device, dtype=x.dtype))
             with torch.cuda.nvtx.range(f"Spark/bridge/communication/segment_broadcast/{index}/owner{owner}"):
-                dist.broadcast(value, src=owner)
+                rdma_ops.broadcast(value, src=owner)
             receipt["broadcast_segments"] += 1
             index += 1
             return value

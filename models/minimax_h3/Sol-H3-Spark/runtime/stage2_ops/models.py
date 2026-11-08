@@ -95,13 +95,11 @@ def construct(models, paths, *, torch, dist, compile_enabled, base, compat):
         raise RuntimeError("expected four All2All instances in the LTX CP group")
     models.attention_manager = manager
     if os.environ.get("SPARK_CP_RDMA", "0") == "1":
-        # LTX head-group pipeline (SPARK_CP_PIPELINE_GROUPS > 1, 2 Sparks): its exchanges over RDMA from host-pinned
-        # buffers (ulysses_head_pipeline.spark_rdma, gitlab-master georgel/ulysses-head-pipeline) instead of NCCL,
-        # which on GB10 holds 4 SMs per exchange and stages through host memory.
-        from ulysses_head_pipeline.spark_rdma import factory as spark_rdma_factory
+        # The mesh factory fails on transport errors and never selects NCCL.
+        from ulysses_head_pipeline.mesh import rdma_factory as spark_rdma_factory
         manager.pipeline_transport_factory = spark_rdma_factory(
             chunk=int(os.environ.get("SPARK_CP_RDMA_CHUNK", str(1 << 20))),
-            port=int(os.environ.get("SPARK_CP_RDMA_PORT", "20411")))
+            port=int(os.environ.get("SPARK_CP_RDMA_PORT", "22000")))
     models.steady_all2all_timeout_s = manager.all2all_timeout_seconds
     if compile_enabled:
         manager.all2all_timeout_seconds = base.COMPILE_WARMUP_ALL2ALL_TIMEOUT_S

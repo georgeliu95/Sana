@@ -1,5 +1,6 @@
 """Broadcast original H3 tensors once at startup; keep steady inference unchanged."""
 from __future__ import annotations
+from ulysses_head_pipeline import collective_ops as rdma_ops
 
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -31,7 +32,7 @@ def shared(values: Iterator[tuple[str, torch.Tensor]], *, to_cpu: bool) -> Itera
         if received is None:
             break
         tensor = item[1].to('cuda').contiguous() if item is not None else torch.empty(received.shape, dtype=received.dtype, device='cuda')
-        dist.broadcast(tensor, src=0)
+        rdma_ops.broadcast(tensor, src=0)
         count += 1
         transferred += tensor.numel() * tensor.element_size()
         yield received.name, tensor.cpu() if to_cpu else tensor

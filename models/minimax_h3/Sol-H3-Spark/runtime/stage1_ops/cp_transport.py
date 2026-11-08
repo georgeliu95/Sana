@@ -1,5 +1,6 @@
 """Fuse VSA output untile, transport padding and original NCCL send layout."""
 from __future__ import annotations
+from ulysses_head_pipeline import collective_ops as rdma_ops
 from dataclasses import dataclass
 import torch
 import torch.distributed as dist
@@ -47,7 +48,7 @@ def exchange_tiled(x: Tensor, index: Tensor, world: int,
             x, index, packed, packed.numel(), shard, heads, dim, tokens,
             x.stride(1), x.stride(2), x.stride(3), 1024)
     with torch.cuda.nvtx.range("Spark/H3/communication/output_AllToAll"):
-        dist.all_to_all_single(received, packed, group=group)
+        rdma_ops.all_to_all_single(received, packed, group=group)
     with torch.cuda.nvtx.range("Spark/H3/communication/output_unpack"):
         return received.transpose(0, 2).contiguous()
 
